@@ -1,4 +1,10 @@
 # Acceptance-test workspace required by SPEC §16 and Appendix A.
 [workspace]
-members = ["crates/uchgs"]
+members = [
+    "crates/uchgs",
+    "crates/uchgs-custody-platform",
+    "crates/uchgs-macos-secure-enclave",
+    "crates/uchgs-unix-account",
+    "crates/uchgs-windows-fs",
+]
 resolver = "3"
