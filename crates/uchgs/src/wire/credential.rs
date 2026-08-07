@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
 
@@ -121,8 +120,7 @@ impl PublicCredentialDocument {
     }
 
     fn from_exact(exact: ExactJson<PublicCredential>) -> Result<Self> {
-        let digest = Digest32::from_bytes(Sha256::digest(exact.bytes()).into());
-        let id = CredentialId::from_digest(digest);
+        let id = CredentialId::from_digest(Digest32::from_bytes(exact.sha256()));
         Ok(Self { exact, id })
     }
 
@@ -140,5 +138,26 @@ impl PublicCredentialDocument {
 
     pub fn id(&self) -> &CredentialId {
         &self.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_id_uses_the_retained_exact_digest() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]).verifying_key();
+        let document = PublicCredentialDocument::encode(PublicCredential::SoftwareEd25519(
+            SoftwareEd25519Credential {
+                kind: CREDENTIAL_KIND.to_owned(),
+                public_key_hex: hex::encode(key.as_bytes()),
+                schema: 1,
+                credential_type: "software-ed25519".to_owned(),
+            },
+        ))
+        .expect("valid credential");
+
+        assert_eq!(document.id().digest(), document.sha256());
     }
 }
