@@ -118,7 +118,7 @@ acceptance_skeleton!(
 acceptance_skeleton!(
     extract_08_signed_commit_rebase_preserves_key,
     "署名付きcommitをrebaseしてもcommitの鍵が変わらない",
-    "SPEC §3.1, §16, Appendix A.2 and A.7"
+    "SPEC §3.1, Appendix A.2, Appendix A.7"
 );
 acceptance_skeleton!(
     extract_09_adding_signature_preserves_key,
