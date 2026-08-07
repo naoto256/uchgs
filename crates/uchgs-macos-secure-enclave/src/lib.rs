@@ -22,7 +22,7 @@ use security_framework_sys::{
         kSecAttrAccessControl, kSecAttrIsPermanent, kSecAttrKeyClass, kSecAttrKeyClassPrivate,
         kSecAttrKeySizeInBits, kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom, kSecAttrTokenID,
         kSecAttrTokenIDSecureEnclave, kSecClass, kSecClassKey, kSecMatchLimit, kSecMatchLimitAll,
-        kSecPrivateKeyAttrs, kSecReturnRef, kSecUseDataProtectionKeychain,
+        kSecPrivateKeyAttrs, kSecReturnRef, kSecUseDataProtectionKeychain, kSecValueRef,
     },
     key::{
         Algorithm, SecKeyCopyExternalRepresentation, SecKeyCopyPublicKey, SecKeyCreateRandomKey,
@@ -51,12 +51,6 @@ unsafe extern "C" {
     static kCFTypeDictionaryValueCallBacks: u8;
     static kCFBooleanTrue: CfTypeRef;
 
-    fn CFArrayCreate(
-        allocator: CfTypeRef,
-        values: *const CfTypeRef,
-        count: isize,
-        callbacks: *const c_void,
-    ) -> CfTypeRef;
     fn CFArrayGetCount(array: CfTypeRef) -> isize;
     fn CFArrayGetTypeID() -> usize;
     fn CFArrayGetValueAtIndex(array: CfTypeRef, index: isize) -> CfTypeRef;
@@ -81,7 +75,6 @@ unsafe extern "C" {
 #[link(name = "Security", kind = "framework")]
 unsafe extern "C" {
     static kSecAttrApplicationTag: CfTypeRef;
-    static kSecMatchItemList: CfTypeRef;
 }
 
 #[cfg(test)]
@@ -434,28 +427,27 @@ fn prove_possession(
         1,
         MAX_PROVIDER_DER_SIGNATURE_LEN,
     )?;
-    let signature = Signature::from_der(&der)
+    let parsed = Signature::from_der(&der)
         .map_err(|_| Error::new("Secure Enclave returned an invalid possession signature"))?;
+    let normalized = parsed.normalize_s().unwrap_or(parsed);
     let verifier = VerifyingKey::from_sec1_bytes(public)
         .map_err(|_| Error::new("Secure Enclave public key is not valid P-256 X9.63"))?;
     verifier
-        .verify(&payload, &signature)
+        .verify(&payload, &normalized)
         .map_err(|_| Error::new("Secure Enclave possession proof failed portable verification"))?;
     Ok(())
 }
 
 fn delete_exact_key(key: &OwnedSecKey) -> Result<(), Error> {
     let query = OwnedCf::dictionary()?;
-    let values: [CfTypeRef; 1] = [key.as_ptr().cast_const().cast()];
-    let item_list = OwnedCf::new(
-        unsafe { CFArrayCreate(ptr::null(), values.as_ptr(), 1, ptr::null()) },
-        "exact Secure Enclave key item list",
-    )?;
     query.set(unsafe { kSecClass.cast() }, unsafe { kSecClassKey.cast() })?;
-    query.set(unsafe { kSecMatchItemList }, item_list.as_ptr())?;
+    query.set(
+        unsafe { kSecValueRef.cast() },
+        key.as_ptr().cast_const().cast(),
+    )?;
     query.set(unsafe { kSecUseDataProtectionKeychain.cast() }, cf_true())?;
     let status = unsafe { SecItemDelete(query.as_ptr().cast()) };
-    if status == errSecSuccess || status == errSecItemNotFound {
+    if status == errSecSuccess {
         Ok(())
     } else {
         Err(Error::new(format!(

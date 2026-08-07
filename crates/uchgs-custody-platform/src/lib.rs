@@ -36,6 +36,7 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[cfg(any(unix, test))]
 fn read_hidden_line(reader: &mut impl std::io::Read) -> Result<Zeroizing<String>, Error> {
     let mut value = Zeroizing::new(Vec::with_capacity(128));
     loop {
@@ -128,7 +129,7 @@ pub fn prompt_hidden(prompt: &str) -> Result<Zeroizing<String>, Error> {
     {
         use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::System::Console::{
-            ENABLE_ECHO_INPUT, GetConsoleMode, SetConsoleMode,
+            ENABLE_ECHO_INPUT, GetConsoleMode, ReadConsoleW, SetConsoleMode,
         };
         let input = fs::OpenOptions::new()
             .read(true)
@@ -158,8 +159,61 @@ pub fn prompt_hidden(prompt: &str) -> Result<Zeroizing<String>, Error> {
             .write_all(prompt.as_bytes())
             .and_then(|_| output.flush())
             .map_err(|error| Error::io("write terminal prompt", error))?;
-        let mut input = &input;
-        let value = read_hidden_line(&mut input)?;
+        let mut units = Zeroizing::new(Vec::<u16>::with_capacity(128));
+        loop {
+            let mut unit = Zeroizing::new([0_u16; 1]);
+            let mut read = 0_u32;
+            if unsafe {
+                ReadConsoleW(
+                    handle,
+                    unit.as_mut_ptr().cast(),
+                    1,
+                    &mut read,
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                return Err(Error::io(
+                    "read terminal passphrase",
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            if read == 0 {
+                return Err(Error::invariant(
+                    "read terminal passphrase",
+                    "controlling terminal closed before line ending",
+                ));
+            }
+            if read != 1 {
+                return Err(Error::invariant(
+                    "read terminal passphrase",
+                    "console returned an unexpected UTF-16 unit count",
+                ));
+            }
+            if unit[0] == b'\n'.into() {
+                break;
+            }
+            if units.len() == MAX_HIDDEN_INPUT_BYTES {
+                return Err(Error::invariant(
+                    "read terminal passphrase",
+                    "input exceeds the bounded terminal secret limit",
+                ));
+            }
+            units.push(unit[0]);
+        }
+        if units.last() == Some(&u16::from(b'\r')) {
+            units.pop();
+        }
+        let value = String::from_utf16(&units).map_err(|_| {
+            Error::invariant("read terminal passphrase", "input must be valid UTF-16")
+        })?;
+        if value.len() > MAX_HIDDEN_INPUT_BYTES {
+            return Err(Error::invariant(
+                "read terminal passphrase",
+                "input exceeds the bounded terminal secret limit",
+            ));
+        }
+        let value = Zeroizing::new(value);
         drop(guard);
         output
             .write_all(b"\r\n")
@@ -268,7 +322,7 @@ mod windows_private_file {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE, LocalFree},
         Security::{
-            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
             },
@@ -490,10 +544,18 @@ mod windows_private_file {
                 std::io::Error::last_os_error(),
             ));
         }
+        let header = unsafe { ptr::read_unaligned(ace.cast::<ACE_HEADER>()) };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+            || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+        {
+            return Err(Error::invariant(
+                "verify private key DACL",
+                "must contain one full access-allowed ACE",
+            ));
+        }
         let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
         let sid = ptr::addr_of!(allowed.SidStart).cast_mut().cast();
-        if allowed.Header.AceType != ACCESS_ALLOWED_ACE_TYPE
-            || (allowed.Header.AceFlags as u32) & INHERITED_ACE != 0
+        if (header.AceFlags as u32) & INHERITED_ACE != 0
             || allowed.Mask != FILE_ALL_ACCESS
             || unsafe { EqualSid(sid, expected_sid) } == 0
         {
