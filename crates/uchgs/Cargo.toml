@@ -1,0 +1,7 @@
+# Minimal crate scaffold for the SPEC §16 and Appendix A acceptance tests.
+[package]
+name = "uchgs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
