@@ -155,6 +155,16 @@ acceptance_skeleton!(
     "Git文法外の時刻・タイムゾーンを持つobjectを拒否する",
     "SPEC §3.1–§3.2, §3.3"
 );
+acceptance_skeleton!(
+    extract_16_non_utf8_identity_reproduces_appendix_a8_key,
+    "UTF-8でないidentity bytesを持つcommitが付録A.8の鍵を再現する",
+    "SPEC §3.1, Appendix A.8"
+);
+acceptance_skeleton!(
+    extract_17_commit_gate_accepts_non_utf8_author_identity,
+    "git var GIT_AUTHOR_IDENTの出力がUTF-8でなくてもcommit gateが動く",
+    "SPEC §3.1, §10.4, Appendix A.8"
+);
 
 // SPEC §16「鍵」; normative rules: SPEC §2.2, §3, §6.3.
 acceptance_skeleton!(
@@ -282,6 +292,11 @@ acceptance_skeleton!(
     push_gate_10_push_intent_omits_connection_url,
     "PushIntentに接続先URLを保存しない",
     "SPEC §11.1"
+);
+acceptance_skeleton!(
+    push_gate_11_state_scope_ignores_ref_namespace,
+    "状態観点がrefの名前空間で絞られない",
+    "SPEC §5.3, §11.4"
 );
 
 // SPEC §16「承認」; normative rules: SPEC §7.
@@ -466,6 +481,23 @@ acceptance_skeleton!(
     "SPEC §7.3–§7.4, §9.3, §9.5"
 );
 
+// SPEC §16「失敗の出し方」; normative rules: SPEC §13.2, §15.
+acceptance_skeleton!(
+    failure_01_all_failures_follow_classification_and_output_contract,
+    "どの失敗も§15の分類を持ち§13.2の出力契約を満たす",
+    "SPEC §13.2, §15"
+);
+acceptance_skeleton!(
+    failure_02_runtime_errors_are_mapped_without_raw_output,
+    "panicを含む想定外の実行時エラーも生出力を見せず最上位で分類へ写像する",
+    "SPEC §13.2, §15"
+);
+acceptance_skeleton!(
+    failure_03_classification_uses_internal_types_not_display_text,
+    "失敗分類は内部型で決まり表示文字列の一致では決まらない",
+    "SPEC §15"
+);
+
 // SPEC §16「存在しないこと」; normative closed surfaces: SPEC §6–§7, §9, §12.
 acceptance_skeleton!(
     absence_01_retired_verbs_records_and_schemas_do_not_exist,
@@ -496,4 +528,19 @@ acceptance_skeleton!(
     absence_06_no_retired_signature_scheme,
     "引退した署名方式の痕跡が存在しない",
     "SPEC §4, §7.3, §8.4"
+);
+acceptance_skeleton!(
+    absence_07_no_exec_scope_shell_or_failure_class,
+    "exec型の観点・shell起動・exec-failed分類が存在しない",
+    "SPEC §5.2–§5.4, §11.4, §15"
+);
+acceptance_skeleton!(
+    absence_08_no_run_field_argument_or_cli_verb,
+    "判定をまとめるrunの欄・引数・CLI動詞が存在しない",
+    "SPEC §6–§7, §12.1"
+);
+acceptance_skeleton!(
+    absence_09_policy_has_no_recall_field,
+    "設定に説明文や表示用テキストのrecall欄が存在しない",
+    "SPEC §5.2–§5.4"
 );

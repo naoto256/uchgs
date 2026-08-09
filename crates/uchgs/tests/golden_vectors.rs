@@ -257,3 +257,26 @@ body line\n";
         "1ea5ffb1268a2514ce841a20c6c19c106f274e95857ef9498d126a1f8afea48b",
     );
 }
+
+/// SPEC Appendix A.8; extraction rule: SPEC §3.1.
+#[test]
+fn a8_non_utf8_identity_bytes() {
+    const INPUT: &[u8] = b"tree da462c9f8a2be3504f3f50d77c36a6066b02d876\n\
+author Ren\xe9 Dubois <rene@example.com> 1700000000 +0900\n\
+committer Ren\xe9 Dubois <rene@example.com> 1700000123 -0500\n\
+\n\
+fix encoding\n";
+    const EXPECTED: &[u8] = b"author Ren\xe9 Dubois <rene@example.com>\n\
+committer Ren\xe9 Dubois <rene@example.com>\n\
+\n\
+fix encoding\n";
+
+    assert_eq!(INPUT.len(), 173, "SPEC Appendix A.8 raw input length");
+    assert_golden(
+        UnitKind::Commit,
+        INPUT,
+        EXPECTED,
+        93,
+        "3bdc2f5072b618cede691d92d8a955438b0f61c494fba34277e2e6f879d4585e",
+    );
+}
