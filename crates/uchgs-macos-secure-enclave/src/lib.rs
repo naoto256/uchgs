@@ -38,7 +38,7 @@ const POSSESSION_DOMAIN: &[u8] = b"uchgs.secure-enclave.possession";
 const POSSESSION_VERSION: u32 = 1;
 const P256_UNCOMPRESSED_PUBLIC_LEN: usize = 65;
 const MAX_PROVIDER_DER_SIGNATURE_LEN: usize = 1024;
-const MAX_KEY_ID_BYTES: usize = 256;
+const MAX_KEY_ID_BYTES: usize = 128;
 
 type CfTypeRef = *const c_void;
 type CfMutableDictionaryRef = *mut c_void;
@@ -457,9 +457,15 @@ fn delete_exact_key(key: &OwnedSecKey) -> Result<(), Error> {
 }
 
 fn validate_key_id(key_id: &str) -> Result<(), Error> {
-    if !(1..=MAX_KEY_ID_BYTES).contains(&key_id.len()) || key_id.chars().any(char::is_control) {
+    let bytes = key_id.as_bytes();
+    if !(1..=MAX_KEY_ID_BYTES).contains(&bytes.len())
+        || bytes.first() == Some(&b'.')
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
         Err(Error::new(format!(
-            "Secure Enclave key id must contain 1..={MAX_KEY_ID_BYTES} UTF-8 bytes and no controls"
+            "Secure Enclave key id must contain 1..={MAX_KEY_ID_BYTES} ASCII bytes from [A-Za-z0-9._-] and must not start with '.'"
         )))
     } else {
         Ok(())
@@ -617,7 +623,13 @@ mod tests {
     #[test]
     fn key_id_validation_is_closed() {
         assert!(validate_key_id("operator").is_ok());
+        assert!(validate_key_id("operator.key_1-2").is_ok());
+        assert!(validate_key_id(&"a".repeat(MAX_KEY_ID_BYTES)).is_ok());
         assert!(validate_key_id("").is_err());
+        assert!(validate_key_id(".hidden").is_err());
+        assert!(validate_key_id("a b").is_err());
+        assert!(validate_key_id("a/b").is_err());
+        assert!(validate_key_id("鍵").is_err());
         assert!(validate_key_id("line\nbreak").is_err());
         assert!(validate_key_id(&"a".repeat(MAX_KEY_ID_BYTES + 1)).is_err());
     }

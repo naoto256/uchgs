@@ -1,10 +1,8 @@
 //! Small safe facade over terminal echo and private-file ACL primitives.
 
-use std::{fs, io::Write as _, path::Path};
+use std::{fs, io::Write as _};
 
 use zeroize::Zeroizing;
-
-const MAX_HIDDEN_INPUT_BYTES: usize = 4096;
 
 #[derive(Debug)]
 pub struct Error {
@@ -50,12 +48,6 @@ fn read_hidden_line(reader: &mut impl std::io::Read) -> Result<Zeroizing<String>
             }
             Ok(_) if byte[0] == b'\n' => break,
             Ok(_) => {
-                if value.len() == MAX_HIDDEN_INPUT_BYTES {
-                    return Err(Error::invariant(
-                        "read terminal passphrase",
-                        "input exceeds the bounded terminal secret limit",
-                    ));
-                }
                 value.push(byte[0]);
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -193,12 +185,6 @@ pub fn prompt_hidden(prompt: &str) -> Result<Zeroizing<String>, Error> {
             if unit[0] == b'\n'.into() {
                 break;
             }
-            if units.len() == MAX_HIDDEN_INPUT_BYTES {
-                return Err(Error::invariant(
-                    "read terminal passphrase",
-                    "input exceeds the bounded terminal secret limit",
-                ));
-            }
             units.push(unit[0]);
         }
         if units.last() == Some(&u16::from(b'\r')) {
@@ -207,12 +193,6 @@ pub fn prompt_hidden(prompt: &str) -> Result<Zeroizing<String>, Error> {
         let value = String::from_utf16(&units).map_err(|_| {
             Error::invariant("read terminal passphrase", "input must be valid UTF-16")
         })?;
-        if value.len() > MAX_HIDDEN_INPUT_BYTES {
-            return Err(Error::invariant(
-                "read terminal passphrase",
-                "input exceeds the bounded terminal secret limit",
-            ));
-        }
         let value = Zeroizing::new(value);
         drop(guard);
         output
@@ -230,21 +210,26 @@ pub fn prompt_hidden(prompt: &str) -> Result<Zeroizing<String>, Error> {
     }
 }
 
-/// Applies the frozen platform-private protection to a new file.
-pub fn protect_private_file(path: &Path) -> Result<(), Error> {
+/// Applies the frozen platform-private protection through the already-opened file.
+///
+/// Taking the handle instead of a path is the authority boundary: a pathname can be
+/// renamed or replaced between creation and protection, so protecting by name may
+/// harden a replacement while leaving the real key readable. The handle designates
+/// the exact file object, so the protection cannot be redirected to another file.
+pub fn protect_private_file(file: &fs::File) -> Result<(), Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|error| Error::io("protect private key", error))
     }
     #[cfg(windows)]
     {
-        windows_private_file::protect(path)
+        windows_private_file::protect(file)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = path;
+        let _ = file;
         Err(Error::invariant(
             "protect private key",
             "unsupported platform",
@@ -252,12 +237,16 @@ pub fn protect_private_file(path: &Path) -> Result<(), Error> {
     }
 }
 
-/// Verifies that only the current operator may read the private file.
-pub fn verify_private_file(path: &Path) -> Result<(), Error> {
+/// Verifies protection on the same already-opened private file.
+///
+/// Verification has to observe the object the caller already holds; re-resolving the
+/// pathname could confirm a different file than the one that will actually be read.
+pub fn verify_private_file(file: &fs::File) -> Result<(), Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = fs::metadata(path)
+        let mode = file
+            .metadata()
             .map_err(|error| Error::io("inspect private key", error))?
             .permissions()
             .mode()
@@ -273,11 +262,11 @@ pub fn verify_private_file(path: &Path) -> Result<(), Error> {
     }
     #[cfg(windows)]
     {
-        windows_private_file::verify(path)
+        windows_private_file::verify(file)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = path;
+        let _ = file;
         Err(Error::invariant(
             "verify private key",
             "unsupported platform",
@@ -318,7 +307,7 @@ impl Drop for WindowsEchoGuard {
 #[cfg(windows)]
 mod windows_private_file {
     use super::*;
-    use std::{ffi::c_void, os::windows::ffi::OsStrExt as _, ptr};
+    use std::{ffi::c_void, os::windows::io::AsRawHandle as _, ptr};
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE, LocalFree},
         Security::{
@@ -326,10 +315,11 @@ mod windows_private_file {
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
             },
-            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetFileSecurityW,
-            GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation,
-            INHERITED_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-            SE_DACL_PROTECTED, SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
+            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+            GetKernelObjectSecurity, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+            GetTokenInformation, INHERITED_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SetKernelObjectSecurity, TOKEN_QUERY,
+            TOKEN_USER, TokenUser,
         },
         Storage::FileSystem::FILE_ALL_ACCESS,
         System::Threading::{GetCurrentProcess, OpenProcessToken},
@@ -346,10 +336,6 @@ mod windows_private_file {
                 CloseHandle(self.0);
             }
         }
-    }
-
-    fn wide_path(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain(Some(0)).collect()
     }
 
     fn current_user_token() -> Result<(OwnedHandle, Vec<usize>), Error> {
@@ -399,7 +385,7 @@ mod windows_private_file {
         }
     }
 
-    pub(super) fn protect(path: &Path) -> Result<(), Error> {
+    pub(super) fn protect(file: &fs::File) -> Result<(), Error> {
         let (_handle, token) = current_user_token()?;
         let sid = token_sid(&token)?;
         let mut sid_text = ptr::null_mut();
@@ -441,10 +427,9 @@ mod windows_private_file {
                 std::io::Error::last_os_error(),
             ));
         }
-        let wide = wide_path(path);
         let result = unsafe {
-            SetFileSecurityW(
-                wide.as_ptr(),
+            SetKernelObjectSecurity(
+                file.as_raw_handle() as HANDLE,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 descriptor,
             )
@@ -458,17 +443,16 @@ mod windows_private_file {
                 std::io::Error::last_os_error(),
             ));
         }
-        verify(path)
+        verify(file)
     }
 
-    pub(super) fn verify(path: &Path) -> Result<(), Error> {
+    pub(super) fn verify(file: &fs::File) -> Result<(), Error> {
         let (_handle, token) = current_user_token()?;
         let expected_sid = token_sid(&token)?;
-        let wide = wide_path(path);
         let mut needed = 0;
         unsafe {
-            GetFileSecurityW(
-                wide.as_ptr(),
+            GetKernelObjectSecurity(
+                file.as_raw_handle() as HANDLE,
                 DACL_SECURITY_INFORMATION,
                 ptr::null_mut(),
                 0,
@@ -481,8 +465,8 @@ mod windows_private_file {
         let word_bytes = std::mem::size_of::<usize>();
         let mut descriptor = vec![0_usize; (needed as usize).div_ceil(word_bytes)];
         if unsafe {
-            GetFileSecurityW(
-                wide.as_ptr(),
+            GetKernelObjectSecurity(
+                file.as_raw_handle() as HANDLE,
                 DACL_SECURITY_INFORMATION,
                 descriptor.as_mut_ptr().cast(),
                 needed,
@@ -573,7 +557,7 @@ mod input_tests {
     use super::*;
 
     #[test]
-    fn hidden_input_is_bounded_and_requires_a_terminal_line_ending() {
+    fn hidden_input_requires_a_terminal_line_ending_without_an_extra_length_policy() {
         let mut unix = std::io::Cursor::new(b"secret\n".as_slice());
         assert_eq!(read_hidden_line(&mut unix).unwrap().as_str(), "secret");
 
@@ -588,15 +572,15 @@ mod input_tests {
                 .contains("controlling terminal closed")
         );
 
-        let oversized = vec![b'x'; MAX_HIDDEN_INPUT_BYTES + 1]
+        let long = vec![b'x'; 4097]
             .into_iter()
             .chain(*b"\n")
             .collect::<Vec<_>>();
-        assert!(
-            read_hidden_line(&mut std::io::Cursor::new(oversized))
-                .unwrap_err()
-                .to_string()
-                .contains("bounded terminal secret limit")
+        assert_eq!(
+            read_hidden_line(&mut std::io::Cursor::new(long))
+                .unwrap()
+                .len(),
+            4097
         );
     }
 }
@@ -612,14 +596,25 @@ mod tests {
             std::env::temp_dir().join(format!("uchgs-custody-platform-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("key");
+        let moved = directory.join("opened-key");
         fs::write(&path, b"secret").unwrap();
-        protect_private_file(&path).unwrap();
+        let file = fs::File::open(&path).unwrap();
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        protect_private_file(&file).unwrap();
         assert_eq!(
+            fs::metadata(&moved).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_ne!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        verify_private_file(&path).unwrap();
+        verify_private_file(&file).unwrap();
+        drop(file);
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(moved);
         let _ = fs::remove_dir(directory);
     }
 }
@@ -630,14 +625,38 @@ mod windows_tests {
 
     #[test]
     fn private_file_dacl_is_exactly_the_protected_operator_ace() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, GENERIC_WRITE},
+            Storage::FileSystem::{READ_CONTROL, WRITE_DAC},
+        };
+
         let directory =
             std::env::temp_dir().join(format!("uchgs-custody-platform-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("key");
-        fs::write(&path, b"secret").unwrap();
-        protect_private_file(&path).unwrap();
-        verify_private_file(&path).unwrap();
+        let moved = directory.join("opened-key");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
+            .open(&path)
+            .unwrap();
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        protect_private_file(&file).unwrap();
+        verify_private_file(&file).unwrap();
+        let replacement = fs::OpenOptions::new()
+            .read(true)
+            .access_mode(GENERIC_READ | READ_CONTROL)
+            .open(&path)
+            .unwrap();
+        assert!(verify_private_file(&replacement).is_err());
+        drop(replacement);
+        drop(file);
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(moved);
         let _ = fs::remove_dir(directory);
     }
 }
