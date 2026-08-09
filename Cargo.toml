@@ -1,0 +1,4 @@
+# Acceptance-test workspace required by SPEC §16 and Appendix A.
+[workspace]
+members = ["crates/uchgs"]
+resolver = "3"
