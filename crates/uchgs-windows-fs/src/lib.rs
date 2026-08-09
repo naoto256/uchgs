@@ -32,7 +32,8 @@ use windows_sys::Win32::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_LIST_DIRECTORY,
         FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileDispositionInfo, GetFileInformationByHandle,
-        GetVolumeInformationByHandleW, SYNCHRONIZE, SetFileInformationByHandle,
+        GetVolumeInformationByHandleW, READ_CONTROL, SYNCHRONIZE, SetFileInformationByHandle,
+        WRITE_DAC,
     },
     System::IO::IO_STATUS_BLOCK,
 };
@@ -61,6 +62,10 @@ struct OpenSpec {
 }
 
 impl RelativeOpenKind {
+    /// `READ_CONTROL` — and `WRITE_DAC` where the file is newly created — are held so
+    /// a private file's DACL can be inspected, and replaced, through this handle
+    /// rather than by pathname. Dropping either right makes the same-handle protect
+    /// and verify path fail with access-denied.
     fn spec(self) -> OpenSpec {
         match self {
             Self::NewRegular => OpenSpec {
@@ -68,6 +73,8 @@ impl RelativeOpenKind {
                     | FILE_WRITE_DATA
                     | FILE_READ_ATTRIBUTES
                     | FILE_WRITE_ATTRIBUTES
+                    | READ_CONTROL
+                    | WRITE_DAC
                     | DELETE
                     | SYNCHRONIZE,
                 file_attributes: FILE_ATTRIBUTE_NORMAL,
@@ -80,7 +87,11 @@ impl RelativeOpenKind {
                 expected_directory: false,
             },
             Self::ExistingRegular => OpenSpec {
-                desired_access: FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+                desired_access: FILE_READ_DATA
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | DELETE
+                    | SYNCHRONIZE,
                 file_attributes: FILE_ATTRIBUTE_NORMAL,
                 create_disposition: FILE_OPEN,
                 create_options: FILE_NON_DIRECTORY_FILE
@@ -598,6 +609,8 @@ mod tests {
                 | FILE_WRITE_DATA
                 | FILE_READ_ATTRIBUTES
                 | FILE_WRITE_ATTRIBUTES
+                | READ_CONTROL
+                | WRITE_DAC
                 | DELETE
                 | SYNCHRONIZE
         );
@@ -610,7 +623,7 @@ mod tests {
         let existing_regular = RelativeOpenKind::ExistingRegular.spec();
         assert_eq!(
             existing_regular.desired_access,
-            FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE | SYNCHRONIZE
         );
         assert_eq!(existing_regular.create_disposition, FILE_OPEN);
         assert_eq!(
