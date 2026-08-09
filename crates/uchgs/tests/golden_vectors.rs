@@ -2,6 +2,11 @@
 //!
 //! The test-local API is intentionally temporary. The extractor remains
 //! deliberately unimplemented until SPEC §3 is implemented.
+//!
+//! Unlike the SPEC §16 skeletons these tests carry no `#[ignore]`, so the suite
+//! fails until the extractor exists. That failing state is the signal itself;
+//! silencing it with `#[ignore]` would drop the requirement without recording
+//! the decision.
 
 #[derive(Clone, Copy)]
 enum UnitKind {
@@ -29,6 +34,9 @@ fn assert_golden(
     expected_length: usize,
     expected_sha256: &str,
 ) {
+    // Validate the transcription before reaching the stub below: this assertion
+    // still runs while extraction is unimplemented, so a mis-copied Appendix A
+    // vector fails on its own terms instead of being masked by the `todo!()`.
     assert_eq!(
         expected_bytes.len(),
         expected_length,
