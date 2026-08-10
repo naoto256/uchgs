@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     Error, Result,
-    authority_file::{PublishOutcome, TrustedRoot},
+    authority_file::{PublishOutcome, TrustedRoot, is_authority_temporary_name},
     extract::{UnitId, UnitKind},
     wire::{
         APPROVAL_MAX_BYTES, Action, ApprovalDocument, CredentialResolver, Digest32,
@@ -363,7 +363,7 @@ impl<'a> Ledger<'a> {
         };
         for entry in entries {
             let name = entry.to_string_lossy();
-            if name.starts_with(".tmp-") {
+            if is_authority_temporary_name(&entry) {
                 continue;
             }
             if name != "unit" && name != "tree" {

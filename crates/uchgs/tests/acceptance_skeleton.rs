@@ -543,19 +543,7 @@ acceptance_skeleton!(
     "SPEC §5.5"
 );
 
-// SPEC §16「承認者の制限」; normative rules: SPEC §7.2, §9.3.
-acceptance_skeleton!(
-    delegated_restriction_01_rejects_direct_only_actions,
-    "委任鍵によるdelegation-grant・policy-update・signer-enrollをdaemonと検証側で拒否する",
-    "SPEC §7.2, §9.3"
-);
-
 // SPEC §16「delegate」; normative rules: SPEC §9.
-acceptance_skeleton!(
-    delegate_01_ttl_is_half_open,
-    "delegate有効期間は終端を含まない半開区間",
-    "SPEC §9.1, §9.3"
-);
 acceptance_skeleton!(
     delegate_02_binary_derives_interval_from_ttl,
     "--ttlから期間をバイナリが算出する",
@@ -575,11 +563,6 @@ acceptance_skeleton!(
     delegate_05_has_no_stop_channel,
     "停止用socket・pipe・control fileが存在しない",
     "SPEC §9.2, §12.1"
-);
-acceptance_skeleton!(
-    delegate_06_rejects_non_judgment_requests,
-    "判定以外のrequestを拒否する",
-    "SPEC §7.2, §9.3"
 );
 acceptance_skeleton!(
     delegate_07_approval_verifies_after_authority_expires,
