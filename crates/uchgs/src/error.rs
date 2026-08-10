@@ -14,6 +14,10 @@ pub enum Error {
         field: &'static str,
         reason: String,
     },
+    AuthorityConflict(String),
+    AuthorityNotFound(String),
+    UnauthorizedApproval(String),
+    UnsupportedPlatform(String),
     Io {
         operation: &'static str,
         kind: std::io::ErrorKind,
@@ -52,6 +56,16 @@ impl fmt::Display for Error {
             }
             Self::InvalidField { field, reason } => {
                 write!(formatter, "invalid {field}: {reason}")
+            }
+            Self::AuthorityConflict(reason) => write!(formatter, "authority conflict: {reason}"),
+            Self::AuthorityNotFound(reason) => {
+                write!(formatter, "authority not found: {reason}")
+            }
+            Self::UnauthorizedApproval(reason) => {
+                write!(formatter, "unauthorized approval: {reason}")
+            }
+            Self::UnsupportedPlatform(reason) => {
+                write!(formatter, "unsupported platform: {reason}")
             }
             Self::Io {
                 operation,

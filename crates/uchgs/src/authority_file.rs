@@ -2,6 +2,7 @@ use std::{
     ffi::OsString,
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
@@ -14,6 +15,18 @@ use cap_std::{
 use fs2::FileExt as _;
 
 use crate::{Error, Result};
+
+const TEMPORARY_ATTEMPTS: u64 = 1024;
+static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Outcome of a no-replace authority publication.
+///
+/// Normative source: SPEC §14.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishOutcome {
+    Published,
+    Existing,
+}
 
 /// Caller-selected authority root opened as a capability.
 ///
@@ -36,17 +49,14 @@ enum WindowsAuthorityCapability {
 fn validate_windows_authority_capability(capability: WindowsAuthorityCapability) -> Result<()> {
     match capability {
         WindowsAuthorityCapability::LocalNtfs => Ok(()),
-        WindowsAuthorityCapability::Remote => Err(Error::field(
-            "authority_publication",
-            "requires a local NTFS authority root; remote filesystems are unsupported",
+        WindowsAuthorityCapability::Remote => Err(Error::UnsupportedPlatform(
+            "requires a local NTFS authority root; remote filesystems are unsupported".to_owned(),
         )),
-        WindowsAuthorityCapability::Other => Err(Error::field(
-            "authority_publication",
-            "requires a local NTFS authority root; this filesystem is unsupported",
+        WindowsAuthorityCapability::Other => Err(Error::UnsupportedPlatform(
+            "requires a local NTFS authority root; this filesystem is unsupported".to_owned(),
         )),
-        WindowsAuthorityCapability::Unknown => Err(Error::field(
-            "authority_publication",
-            "requires a proven local NTFS authority root",
+        WindowsAuthorityCapability::Unknown => Err(Error::UnsupportedPlatform(
+            "requires a proven local NTFS authority root".to_owned(),
         )),
     }
 }
@@ -222,6 +232,173 @@ impl TrustedRoot {
         Ok(names)
     }
 
+    /// Publishes one complete authority file through a same-directory temporary
+    /// file. `replace` is reserved for the ledger append exception in §6.4.
+    ///
+    /// Normative source: SPEC §6.4 and §14.2.
+    pub(crate) fn publish_file(
+        &self,
+        relative: &Path,
+        bytes: &[u8],
+        replace: bool,
+    ) -> Result<PublishOutcome> {
+        self.require_writable_authority_filesystem()?;
+        let (parent_path, final_name) = split_file_path(relative)?;
+        let parent = self.ensure_dir(&parent_path)?;
+        self.cleanup_foreign_temporaries(&parent)?;
+
+        for _ in 0..TEMPORARY_ATTEMPTS {
+            let counter = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let temporary_name = OsString::from(format!(
+                ".tmp-authority-{}-{counter}-{}",
+                std::process::id(),
+                final_name.to_string_lossy()
+            ));
+            let temporary_path = Path::new(&temporary_name);
+            let mut staged = match Self::write_new_file(&parent, temporary_path, bytes) {
+                Ok(staged) => staged,
+                Err(Error::Io {
+                    kind: std::io::ErrorKind::AlreadyExists,
+                    ..
+                }) => continue,
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = Self::reverify_staged_file(&mut staged, bytes) {
+                Self::remove_staged_file(&parent, temporary_path, &staged);
+                return Err(error);
+            }
+
+            let outcome = Self::rename_staged_file(
+                &parent,
+                temporary_path,
+                &staged,
+                Path::new(&final_name),
+                replace,
+            );
+            match outcome {
+                Ok(PublishOutcome::Published) => {
+                    #[cfg(not(windows))]
+                    Self::sync_dir(&parent)?;
+                    let committed =
+                        Self::read_dir_file(&parent, Path::new(&final_name), bytes.len())?;
+                    if committed != bytes {
+                        return Err(Error::AuthorityConflict(format!(
+                            "published authority file {} does not match the committed bytes",
+                            relative.display()
+                        )));
+                    }
+                    return Ok(PublishOutcome::Published);
+                }
+                Ok(PublishOutcome::Existing) => {
+                    Self::remove_staged_file(&parent, temporary_path, &staged);
+                    return Ok(PublishOutcome::Existing);
+                }
+                Err(error) => {
+                    Self::remove_staged_file(&parent, temporary_path, &staged);
+                    return Err(error);
+                }
+            }
+        }
+        Err(Error::AuthorityConflict(format!(
+            "could not allocate a temporary authority name after {TEMPORARY_ATTEMPTS} attempts"
+        )))
+    }
+
+    /// Removes one direct authority file through its validated parent.
+    ///
+    /// Normative source: SPEC §7.5 and §14.2.
+    pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {
+        self.require_writable_authority_filesystem()?;
+        let (parent_path, name) = split_file_path(relative)?;
+        let parent = self.open_dir(&parent_path)?;
+        parent
+            .remove_file(Path::new(&name))
+            .map_err(|error| Error::io("remove authority file", error))?;
+        #[cfg(not(windows))]
+        Self::sync_dir(&parent)?;
+        Ok(())
+    }
+
+    /// Moves one completed authority directory to a final name without
+    /// replacing an existing winner.
+    ///
+    /// Normative source: SPEC §7.5, §7.6, and §14.2.
+    pub(crate) fn rename_directory_no_replace(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<PublishOutcome> {
+        self.require_writable_authority_filesystem()?;
+        let (source_parent_path, source_name) = split_file_path(source)?;
+        let (destination_parent_path, destination_name) = split_file_path(destination)?;
+        let source_parent = self.open_dir(&source_parent_path)?;
+        let destination_parent = self.ensure_dir(&destination_parent_path)?;
+
+        #[cfg(not(windows))]
+        let outcome = rename_no_replace(
+            &source_parent,
+            Path::new(&source_name),
+            &destination_parent,
+            Path::new(&destination_name),
+        )?;
+
+        #[cfg(windows)]
+        let outcome = {
+            let source_parent_file = source_parent
+                .try_clone()
+                .map_err(|error| Error::io("clone authority source parent", error))?
+                .into_std_file();
+            let destination_parent_file = destination_parent
+                .try_clone()
+                .map_err(|error| Error::io("clone authority destination parent", error))?
+                .into_std_file();
+            let source = uchgs_windows_fs::open_directory(&source_parent_file, &source_name)
+                .map_err(|error| Error::io("open authority directory for rename", error))?;
+            match uchgs_windows_fs::rename_to(
+                &source,
+                &destination_parent_file,
+                &destination_name,
+                false,
+            ) {
+                Ok(uchgs_windows_fs::RenameOutcome::Renamed) => PublishOutcome::Published,
+                Ok(uchgs_windows_fs::RenameOutcome::Existing) => PublishOutcome::Existing,
+                Err(error) => {
+                    return Err(Error::io(
+                        "rename authority directory",
+                        error.into_io_error(),
+                    ));
+                }
+            }
+        };
+
+        if outcome == PublishOutcome::Published {
+            #[cfg(not(windows))]
+            {
+                Self::sync_dir(&source_parent)?;
+                if source_parent_path != destination_parent_path {
+                    Self::sync_dir(&destination_parent)?;
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn cleanup_foreign_temporaries(&self, parent: &Dir) -> Result<()> {
+        let own_prefix = format!(".tmp-authority-{}-", std::process::id());
+        let entries = parent
+            .entries()
+            .map_err(|error| Error::io("list authority temporary files", error))?;
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
+            let display = name.to_string_lossy();
+            if display.starts_with(".tmp-") && !display.starts_with(&own_prefix) {
+                let _ = parent.remove_file(Path::new(&name));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn lock(&self, name: &'static str) -> Result<AuthorityLock> {
         self.require_writable_authority_filesystem()?;
         let path = Path::new(name);
@@ -229,10 +406,20 @@ impl TrustedRoot {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         options.follow(FollowSymlinks::No);
-        let file = self
-            .dir
-            .open_with(path, &options)
-            .map_err(|error| Error::io("open authority lock", error))?;
+        let mut attempts = 0;
+        let file = loop {
+            match self.dir.open_with(path, &options) {
+                Ok(file) => break file,
+                // A simultaneous create/open can transiently lose the name
+                // between the no-follow resolution steps. Retrying preserves
+                // the single named lock without introducing another namespace.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && attempts < 16 => {
+                    attempts += 1;
+                    std::thread::yield_now();
+                }
+                Err(error) => return Err(Error::io("open authority lock", error)),
+            }
+        };
         let metadata = file
             .metadata()
             .map_err(|error| Error::io("stat authority lock", error))?;
@@ -331,6 +518,28 @@ impl TrustedRoot {
         Ok(())
     }
 
+    #[cfg(not(windows))]
+    fn rename_staged_file(
+        parent: &Dir,
+        temporary_name: &Path,
+        _staged: &File,
+        final_name: &Path,
+        replace: bool,
+    ) -> Result<PublishOutcome> {
+        if replace {
+            parent
+                .rename(temporary_name, parent, final_name)
+                .map_err(|error| Error::io("replace authority file", error))?;
+            return Ok(PublishOutcome::Published);
+        }
+        rename_no_replace(parent, temporary_name, parent, final_name)
+    }
+
+    #[cfg(not(windows))]
+    fn remove_staged_file(parent: &Dir, temporary_name: &Path, _staged: &File) {
+        let _ = parent.remove_file(temporary_name);
+    }
+
     #[cfg(windows)]
     pub(crate) fn reverify_staged_file(
         file: &mut uchgs_windows_fs::OpenedObject,
@@ -372,6 +581,34 @@ impl TrustedRoot {
             ));
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn rename_staged_file(
+        parent: &Dir,
+        _temporary_name: &Path,
+        staged: &uchgs_windows_fs::OpenedObject,
+        final_name: &Path,
+        replace: bool,
+    ) -> Result<PublishOutcome> {
+        let parent = parent
+            .try_clone()
+            .map_err(|error| Error::io("clone authority publication parent", error))?
+            .into_std_file();
+        match uchgs_windows_fs::rename_to(staged, &parent, final_name.as_os_str(), replace) {
+            Ok(uchgs_windows_fs::RenameOutcome::Renamed) => Ok(PublishOutcome::Published),
+            Ok(uchgs_windows_fs::RenameOutcome::Existing) => Ok(PublishOutcome::Existing),
+            Err(error) => Err(Error::io("publish authority file", error.into_io_error())),
+        }
+    }
+
+    #[cfg(windows)]
+    fn remove_staged_file(
+        _parent: &Dir,
+        _temporary_name: &Path,
+        staged: &uchgs_windows_fs::OpenedObject,
+    ) {
+        let _ = uchgs_windows_fs::delete_opened_regular(staged);
     }
 
     pub(crate) fn require_writable_authority_filesystem(&self) -> Result<()> {
@@ -455,6 +692,102 @@ fn validate_relative(path: &Path, allow_empty: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(
+    unix,
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+fn rename_no_replace(
+    source_parent: &Dir,
+    source_name: &Path,
+    destination_parent: &Dir,
+    destination_name: &Path,
+) -> Result<PublishOutcome> {
+    use rustix::fs::{RenameFlags, renameat_with};
+    match renameat_with(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Ok(PublishOutcome::Published),
+        Err(error) if error == rustix::io::Errno::EXIST => Ok(PublishOutcome::Existing),
+        Err(error) => Err(Error::io(
+            "publish authority name",
+            std::io::Error::from_raw_os_error(error.raw_os_error()),
+        )),
+    }
+}
+
+#[cfg(all(unix, target_os = "freebsd"))]
+fn rename_no_replace(
+    source_parent: &Dir,
+    source_name: &Path,
+    destination_parent: &Dir,
+    destination_name: &Path,
+) -> Result<PublishOutcome> {
+    use std::{
+        ffi::CString,
+        os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _},
+    };
+
+    unsafe extern "C" {
+        fn renameat2(
+            fromfd: std::ffi::c_int,
+            from: *const std::ffi::c_char,
+            tofd: std::ffi::c_int,
+            to: *const std::ffi::c_char,
+            flags: std::ffi::c_uint,
+        ) -> std::ffi::c_int;
+    }
+
+    const RENAME_NOREPLACE: std::ffi::c_uint = 1;
+    let source = CString::new(source_name.as_os_str().as_bytes())
+        .map_err(|_| Error::field("authority_path", "contains NUL"))?;
+    let destination = CString::new(destination_name.as_os_str().as_bytes())
+        .map_err(|_| Error::field("authority_path", "contains NUL"))?;
+    // SAFETY: both C strings are NUL-terminated and remain live for the call;
+    // both descriptors are retained validated directory capabilities.
+    let result = unsafe {
+        renameat2(
+            source_parent.as_raw_fd(),
+            source.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(PublishOutcome::Published);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        Ok(PublishOutcome::Existing)
+    } else {
+        Err(Error::io("publish authority name", error))
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    ))
+))]
+fn rename_no_replace(
+    _source_parent: &Dir,
+    _source_name: &Path,
+    _destination_parent: &Dir,
+    _destination_name: &Path,
+) -> Result<PublishOutcome> {
+    Err(Error::UnsupportedPlatform(
+        "no atomic no-replace rename is available on this Unix platform".to_owned(),
+    ))
+}
+
 #[cfg(unix)]
 fn native_name_bytes(value: &OsString) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -519,10 +852,7 @@ mod tests {
         ] {
             assert!(matches!(
                 validate_windows_authority_capability(capability).unwrap_err(),
-                Error::InvalidField {
-                    field: "authority_publication",
-                    ..
-                }
+                Error::UnsupportedPlatform(_)
             ));
         }
     }
