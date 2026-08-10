@@ -101,6 +101,7 @@ impl std::error::Error for Error {}
 /// A newly persisted key armed for exact rollback until public publication.
 pub struct Creation {
     key: Option<OwnedSecKey>,
+    key_id: String,
     public_key_x963: [u8; P256_UNCOMPRESSED_PUBLIC_LEN],
 }
 
@@ -120,7 +121,8 @@ impl Drop for Creation {
         if let Some(key) = self.key.take() {
             if let Err(error) = delete_exact_key(&key) {
                 eprintln!(
-                    "uchgs: warning: Secure Enclave rollback failed before credential publication: {error}"
+                    "uchgs: warning: Secure Enclave rollback for key {:?} failed before credential publication: {error}",
+                    self.key_id
                 );
             }
         }
@@ -139,6 +141,7 @@ pub fn create(key_id: &str) -> Result<Creation, Error> {
     let key = create_key(&tag)?;
     let mut creation = Creation {
         key: Some(key),
+        key_id: key_id.to_owned(),
         public_key_x963: [0; P256_UNCOMPRESSED_PUBLIC_LEN],
     };
     #[cfg(test)]
@@ -302,6 +305,9 @@ fn lookup_key(tag: &[u8; 32], key_id: &str) -> Result<Option<OwnedSecKey>, Error
         ));
     }
     let count = unsafe { CFArrayGetCount(result.as_ptr()) };
+    if count == 0 {
+        return Ok(None);
+    }
     if count != 1 {
         return Err(Error::new(format!(
             "Secure Enclave lookup for key {key_id:?} is ambiguous: {count} exact matches"
@@ -447,7 +453,7 @@ fn delete_exact_key(key: &OwnedSecKey) -> Result<(), Error> {
     )?;
     query.set(unsafe { kSecUseDataProtectionKeychain.cast() }, cf_true())?;
     let status = unsafe { SecItemDelete(query.as_ptr().cast()) };
-    if status == errSecSuccess {
+    if status == errSecSuccess || status == errSecItemNotFound {
         Ok(())
     } else {
         Err(Error::new(format!(
@@ -614,6 +620,14 @@ mod tests {
 
     static SECURE_ENCLAVE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    struct FailureStageReset;
+
+    impl Drop for FailureStageReset {
+        fn drop(&mut self) {
+            CREATE_FAILURE_STAGE.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn application_tag_is_versioned_and_key_bound() {
         assert_eq!(application_tag("alpha"), application_tag("alpha"));
@@ -650,6 +664,7 @@ mod tests {
             .expect("lookup")
             .expect("key exists");
         delete_exact_key(&key).expect("delete exact drill key");
+        delete_exact_key(&key).expect("repeat exact delete is idempotent");
         assert!(
             lookup_key(&application_tag(&key_id), &key_id)
                 .expect("post-delete lookup")
@@ -678,6 +693,7 @@ mod tests {
                 u64::from_be_bytes(suffix)
             );
             CREATE_FAILURE_STAGE.store(stage, std::sync::atomic::Ordering::SeqCst);
+            let _reset_stage = FailureStageReset;
             assert!(create(&key_id).is_err());
             assert!(
                 lookup_key(&application_tag(&key_id), &key_id)

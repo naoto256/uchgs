@@ -2,7 +2,88 @@
 
 use std::{fs, io::Write as _};
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
+
+const SECRET_INPUT_CHUNK_UNITS: usize = 128;
+
+struct SecretInput<T>
+where
+    T: Copy + Default + Zeroize,
+{
+    chunks: Vec<Zeroizing<Box<[T]>>>,
+    len: usize,
+}
+
+impl<T> SecretInput<T>
+where
+    T: Copy + Default + Zeroize,
+{
+    fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, value: T) {
+        let chunk_index = self.len / SECRET_INPUT_CHUNK_UNITS;
+        let unit_index = self.len % SECRET_INPUT_CHUNK_UNITS;
+        if chunk_index == self.chunks.len() {
+            self.chunks.push(Zeroizing::new(
+                vec![T::default(); SECRET_INPUT_CHUNK_UNITS].into_boxed_slice(),
+            ));
+        }
+        self.chunks[chunk_index][unit_index] = value;
+        self.len += 1;
+    }
+
+    fn last(&self) -> Option<T> {
+        self.len.checked_sub(1).map(|index| {
+            self.chunks[index / SECRET_INPUT_CHUNK_UNITS][index % SECRET_INPUT_CHUNK_UNITS]
+        })
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        let index = self.len.checked_sub(1)?;
+        let value = self.chunks[index / SECRET_INPUT_CHUNK_UNITS][index % SECRET_INPUT_CHUNK_UNITS];
+        self.chunks[index / SECRET_INPUT_CHUNK_UNITS][index % SECRET_INPUT_CHUNK_UNITS].zeroize();
+        self.len = index;
+        Some(value)
+    }
+
+    fn into_vec(self) -> Zeroizing<Vec<T>> {
+        let mut output = Zeroizing::new(Vec::with_capacity(self.len));
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            let remaining = self.len.saturating_sub(index * SECRET_INPUT_CHUNK_UNITS);
+            let used = remaining.min(SECRET_INPUT_CHUNK_UNITS);
+            output.extend_from_slice(&chunk[..used]);
+        }
+        output
+    }
+}
+
+#[cfg(any(windows, test))]
+fn utf16_hidden_string(units: &[u16]) -> Result<Zeroizing<String>, Error> {
+    let mut bytes = SecretInput::new();
+    for decoded in char::decode_utf16(units.iter().copied()) {
+        let character = decoded.map_err(|_| {
+            Error::invariant("read terminal passphrase", "input must be valid UTF-16")
+        })?;
+        let mut encoded = Zeroizing::new([0_u8; 4]);
+        for byte in character.encode_utf8(&mut *encoded).as_bytes() {
+            bytes.push(*byte);
+        }
+    }
+    let mut bytes = bytes.into_vec();
+    let value = String::from_utf8(std::mem::take(&mut *bytes)).map_err(|error| {
+        let _bytes = Zeroizing::new(error.into_bytes());
+        Error::invariant(
+            "read terminal passphrase",
+            "UTF-16 input changed after UTF-8 encoding",
+        )
+    })?;
+    Ok(Zeroizing::new(value))
+}
 
 #[derive(Debug)]
 pub struct Error {
@@ -36,7 +117,7 @@ impl std::error::Error for Error {}
 
 #[cfg(any(unix, test))]
 fn read_hidden_line(reader: &mut impl std::io::Read) -> Result<Zeroizing<String>, Error> {
-    let mut value = Zeroizing::new(Vec::with_capacity(128));
+    let mut value = SecretInput::new();
     loop {
         let mut byte = Zeroizing::new([0_u8; 1]);
         match reader.read(&mut *byte) {
@@ -54,17 +135,17 @@ fn read_hidden_line(reader: &mut impl std::io::Read) -> Result<Zeroizing<String>
             Err(error) => return Err(Error::io("read terminal passphrase", error)),
         }
     }
-    if value.last() == Some(&b'\r') {
+    if value.last() == Some(b'\r') {
         value.pop();
     }
-    if std::str::from_utf8(&value).is_err() {
+    let mut bytes = value.into_vec();
+    if std::str::from_utf8(&bytes).is_err() {
         return Err(Error::invariant(
             "read terminal passphrase",
             "input must be valid UTF-8",
         ));
     }
-    let bytes = std::mem::take(&mut *value);
-    match String::from_utf8(bytes) {
+    match String::from_utf8(std::mem::take(&mut *bytes)) {
         Ok(value) => Ok(Zeroizing::new(value)),
         Err(error) => {
             let _bytes = Zeroizing::new(error.into_bytes());
@@ -151,7 +232,7 @@ pub fn prompt_hidden(prompt: &str) -> Result<Zeroizing<String>, Error> {
             .write_all(prompt.as_bytes())
             .and_then(|_| output.flush())
             .map_err(|error| Error::io("write terminal prompt", error))?;
-        let mut units = Zeroizing::new(Vec::<u16>::with_capacity(128));
+        let mut units = SecretInput::new();
         loop {
             let mut unit = Zeroizing::new([0_u16; 1]);
             let mut read = 0_u32;
@@ -187,13 +268,11 @@ pub fn prompt_hidden(prompt: &str) -> Result<Zeroizing<String>, Error> {
             }
             units.push(unit[0]);
         }
-        if units.last() == Some(&u16::from(b'\r')) {
+        if units.last() == Some(u16::from(b'\r')) {
             units.pop();
         }
-        let value = String::from_utf16(&units).map_err(|_| {
-            Error::invariant("read terminal passphrase", "input must be valid UTF-16")
-        })?;
-        let value = Zeroizing::new(value);
+        let units = units.into_vec();
+        let value = utf16_hidden_string(&units)?;
         drop(guard);
         output
             .write_all(b"\r\n")
@@ -216,6 +295,8 @@ pub fn prompt_hidden(prompt: &str) -> Result<Zeroizing<String>, Error> {
 /// renamed or replaced between creation and protection, so protecting by name may
 /// harden a replacement while leaving the real key readable. The handle designates
 /// the exact file object, so the protection cannot be redirected to another file.
+/// On Windows the handle must grant `WRITE_DAC`; callers obtain that right when the
+/// private file is first created rather than reopening it by name.
 pub fn protect_private_file(file: &fs::File) -> Result<(), Error> {
     #[cfg(unix)]
     {
@@ -241,6 +322,7 @@ pub fn protect_private_file(file: &fs::File) -> Result<(), Error> {
 ///
 /// Verification has to observe the object the caller already holds; re-resolving the
 /// pathname could confirm a different file than the one that will actually be read.
+/// On Windows the handle must grant `READ_CONTROL` so its DACL can be inspected.
 pub fn verify_private_file(file: &fs::File) -> Result<(), Error> {
     #[cfg(unix)]
     {
@@ -376,12 +458,26 @@ mod windows_private_file {
         Ok((handle, words))
     }
 
-    fn token_sid(words: &[usize]) -> Result<PSID, Error> {
+    struct TokenSid<'token> {
+        raw: PSID,
+        _token: std::marker::PhantomData<&'token [usize]>,
+    }
+
+    impl TokenSid<'_> {
+        fn as_raw(&self) -> PSID {
+            self.raw
+        }
+    }
+
+    fn token_sid(words: &[usize]) -> Result<TokenSid<'_>, Error> {
         let user = unsafe { &*words.as_ptr().cast::<TOKEN_USER>() };
         if user.User.Sid.is_null() {
             Err(Error::invariant("read Windows token", "user SID is null"))
         } else {
-            Ok(user.User.Sid)
+            Ok(TokenSid {
+                raw: user.User.Sid,
+                _token: std::marker::PhantomData,
+            })
         }
     }
 
@@ -389,7 +485,7 @@ mod windows_private_file {
         let (_handle, token) = current_user_token()?;
         let sid = token_sid(&token)?;
         let mut sid_text = ptr::null_mut();
-        if unsafe { ConvertSidToStringSidW(sid, &mut sid_text) } == 0 {
+        if unsafe { ConvertSidToStringSidW(sid.as_raw(), &mut sid_text) } == 0 {
             return Err(Error::io(
                 "format current user SID",
                 std::io::Error::last_os_error(),
@@ -541,7 +637,7 @@ mod windows_private_file {
         let sid = ptr::addr_of!(allowed.SidStart).cast_mut().cast();
         if (header.AceFlags as u32) & INHERITED_ACE != 0
             || allowed.Mask != FILE_ALL_ACCESS
-            || unsafe { EqualSid(sid, expected_sid) } == 0
+            || unsafe { EqualSid(sid, expected_sid.as_raw()) } == 0
         {
             return Err(Error::invariant(
                 "verify private key DACL",
@@ -571,6 +667,22 @@ mod input_tests {
                 .to_string()
                 .contains("controlling terminal closed")
         );
+
+        let mut invalid_utf8 = std::io::Cursor::new([0xff, b'\n']);
+        assert!(
+            read_hidden_line(&mut invalid_utf8)
+                .unwrap_err()
+                .to_string()
+                .contains("valid UTF-8")
+        );
+
+        assert_eq!(
+            utf16_hidden_string(&[b's'.into(), 0xd83d, 0xdd10])
+                .unwrap()
+                .as_str(),
+            "s🔐"
+        );
+        assert!(utf16_hidden_string(&[0xd800]).is_err());
 
         let long = vec![b'x'; 4097]
             .into_iter()

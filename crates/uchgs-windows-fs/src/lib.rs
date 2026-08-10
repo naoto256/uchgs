@@ -478,6 +478,10 @@ fn ntstatus_error(status: i32) -> io::Error {
 /// Renames a source whose access/share/write-through contract was acquired by
 /// this crate at its first create/open. The destination is resolved only as a
 /// direct child of the caller's already-validated parent handle.
+///
+/// The source handle carries `FILE_WRITE_THROUGH`; on NTFS that makes metadata
+/// changes caused by this request, including the rename, flush without a later
+/// ambient-path directory operation.
 pub fn rename_to(
     source: &OpenedObject,
     destination_parent: &std::fs::File,
