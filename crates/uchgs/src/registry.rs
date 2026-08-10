@@ -8,7 +8,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     Error, Result,
-    authority_file::TrustedRoot,
+    authority_file::{TrustedRoot, is_authority_temporary_name},
     wire::{
         APPROVAL_MAX_BYTES, Action, ApprovalDocument, CREDENTIAL_MAX_BYTES, CredentialId,
         CredentialResolver, Digest32, ExactJson, GenesisId, PublicCredentialDocument,
@@ -444,7 +444,7 @@ fn entries_or_empty(root: &TrustedRoot, path: &Path) -> Result<Vec<std::ffi::OsS
     match root.entries(path) {
         Ok(entries) => Ok(entries
             .into_iter()
-            .filter(|entry| !entry.to_string_lossy().starts_with(".tmp-"))
+            .filter(|entry| !is_authority_temporary_name(entry))
             .collect()),
         Err(Error::Io {
             kind: std::io::ErrorKind::NotFound,
@@ -465,6 +465,7 @@ fn require_exact_bundle(root: &TrustedRoot, directory: &Path) -> Result<()> {
     let mut entries = root
         .entries(directory)?
         .into_iter()
+        .filter(|entry| !is_authority_temporary_name(entry))
         .map(|entry| strict_component(&entry, "enrollment bundle entry"))
         .collect::<Result<Vec<_>>>()?;
     entries.sort();

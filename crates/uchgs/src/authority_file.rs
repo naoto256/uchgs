@@ -1,5 +1,5 @@
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -18,6 +18,49 @@ use crate::{Error, Result};
 
 const TEMPORARY_ATTEMPTS: u64 = 1024;
 static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Identifies the shared §14.2 temporary-name namespace.
+///
+/// One recognizer decides both what the cleanup paths may delete and what directory
+/// scans skip, so the set of names this module may remove is exactly the set it
+/// ignores. It accepts only what `authority_temporary_name` produces; a broader
+/// prefix match would let an unrelated `.tmp-*` file be deleted, or be skipped as
+/// though it were our own leftover.
+pub(crate) fn is_authority_temporary_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(fields) = name.strip_prefix(".tmp-authority-") else {
+        return false;
+    };
+    let mut fields = fields.splitn(3, '-');
+    let (Some(pid), Some(sequence), Some(final_name)) =
+        (fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    let mut components = Path::new(final_name).components();
+    let valid_final_name =
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+    matches!(
+        parse_canonical_decimal(pid),
+        Some(pid) if pid != 0 && pid <= u64::from(u32::MAX)
+    ) && parse_canonical_decimal(sequence).is_some()
+        && valid_final_name
+}
+
+fn parse_canonical_decimal(value: &str) -> Option<u64> {
+    let parsed = value.parse::<u64>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
+fn authority_temporary_name(final_name: &OsStr, counter: u64) -> OsString {
+    OsString::from(format!(
+        ".tmp-authority-{}-{counter}-{}",
+        std::process::id(),
+        final_name.to_string_lossy()
+    ))
+}
 
 /// Outcome of a no-replace authority publication.
 ///
@@ -249,11 +292,7 @@ impl TrustedRoot {
 
         for _ in 0..TEMPORARY_ATTEMPTS {
             let counter = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let temporary_name = OsString::from(format!(
-                ".tmp-authority-{}-{counter}-{}",
-                std::process::id(),
-                final_name.to_string_lossy()
-            ));
+            let temporary_name = authority_temporary_name(&final_name, counter);
             let temporary_path = Path::new(&temporary_name);
             let mut staged = match Self::write_new_file(&parent, temporary_path, bytes) {
                 Ok(staged) => staged,
@@ -392,7 +431,7 @@ impl TrustedRoot {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name();
             let display = name.to_string_lossy();
-            if display.starts_with(".tmp-") && !display.starts_with(&own_prefix) {
+            if is_authority_temporary_name(&name) && !display.starts_with(&own_prefix) {
                 let _ = parent.remove_file(Path::new(&name));
             }
         }
@@ -712,11 +751,40 @@ fn rename_no_replace(
     ) {
         Ok(()) => Ok(PublishOutcome::Published),
         Err(error) if error == rustix::io::Errno::EXIST => Ok(PublishOutcome::Existing),
-        Err(error) => Err(Error::io(
+        Err(error) => Err(map_no_replace_error(error)),
+    }
+}
+
+#[cfg(all(
+    unix,
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+fn map_no_replace_error(error: rustix::io::Errno) -> Error {
+    if no_replace_is_unsupported(error) {
+        Error::UnsupportedPlatform(
+            "atomic no-replace rename is unavailable on this kernel or filesystem".to_owned(),
+        )
+    } else {
+        Error::io(
             "publish authority name",
             std::io::Error::from_raw_os_error(error.raw_os_error()),
-        )),
+        )
     }
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+fn no_replace_is_unsupported(error: rustix::io::Errno) -> bool {
+    // renameat2(2) assigns EINVAL to an unsupported flag on the target
+    // filesystem. This call supplies the sole valid NOREPLACE flag and all
+    // path components were validated before reaching this boundary.
+    matches!(error, rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL)
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn no_replace_is_unsupported(error: rustix::io::Errno) -> bool {
+    // renameatx_np(2) uses ENOTSUP for a filesystem that cannot honor the
+    // requested flag; EINVAL has broader meanings and deliberately stays I/O.
+    matches!(error, rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP)
 }
 
 #[cfg(all(unix, target_os = "freebsd"))]
@@ -764,7 +832,21 @@ fn rename_no_replace(
     if error.kind() == std::io::ErrorKind::AlreadyExists {
         Ok(PublishOutcome::Existing)
     } else {
-        Err(Error::io("publish authority name", error))
+        Err(map_freebsd_no_replace_error(error))
+    }
+}
+
+#[cfg(all(unix, target_os = "freebsd"))]
+fn map_freebsd_no_replace_error(error: std::io::Error) -> Error {
+    let unsupported = [rustix::io::Errno::NOTSUP, rustix::io::Errno::NOSYS]
+        .into_iter()
+        .any(|errno| error.raw_os_error() == Some(errno.raw_os_error()));
+    if unsupported {
+        Error::UnsupportedPlatform(
+            "atomic no-replace rename is unavailable on this kernel or filesystem".to_owned(),
+        )
+    } else {
+        Error::io("publish authority name", error)
     }
 }
 
@@ -810,6 +892,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn temporary_name_recognizer_matches_only_generated_grammar() {
+        for final_name in [
+            OsStr::new("record.json"),
+            OsStr::new("record-with-hyphen.json"),
+        ] {
+            let generated = authority_temporary_name(final_name, 7);
+            assert!(is_authority_temporary_name(&generated));
+        }
+
+        for invalid in [
+            ".tmp-garbage",
+            ".tmp-unknown",
+            ".tmp-authority",
+            ".tmp-authority--1-record.json",
+            ".tmp-authority-0-1-record.json",
+            ".tmp-authority-01-1-record.json",
+            ".tmp-authority-1--record.json",
+            ".tmp-authority-1-01-record.json",
+            ".tmp-authority-1-1-",
+            ".tmp-authority-1-1-.",
+            ".tmp-authority-1-1-..",
+            ".tmp-authority-1-1-dir/record.json",
+            ".tmp-policy-1-1-record.json",
+            ".tmpx-authority-1-1-record.json",
+        ] {
+            assert!(
+                !is_authority_temporary_name(OsStr::new(invalid)),
+                "unexpected temporary name: {invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn growth_after_initial_stat_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("growing");
@@ -840,6 +955,55 @@ mod tests {
 
         TrustedRoot::sync_dir(&staging).unwrap();
         TrustedRoot::sync_dir(&parent).unwrap();
+    }
+
+    #[cfg(all(
+        unix,
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[test]
+    fn unavailable_atomic_no_replace_has_a_typed_platform_error() {
+        assert!(matches!(
+            map_no_replace_error(rustix::io::Errno::NOSYS),
+            Error::UnsupportedPlatform(_)
+        ));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(matches!(
+            map_no_replace_error(rustix::io::Errno::INVAL),
+            Error::UnsupportedPlatform(_)
+        ));
+        #[cfg(target_vendor = "apple")]
+        assert!(matches!(
+            map_no_replace_error(rustix::io::Errno::NOTSUP),
+            Error::UnsupportedPlatform(_)
+        ));
+        assert!(matches!(
+            map_no_replace_error(rustix::io::Errno::IO),
+            Error::Io { .. }
+        ));
+    }
+
+    #[cfg(all(unix, target_os = "freebsd"))]
+    #[test]
+    fn freebsd_unsupported_no_replace_has_a_typed_platform_error() {
+        assert!(matches!(
+            map_freebsd_no_replace_error(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::NOTSUP.raw_os_error()
+            )),
+            Error::UnsupportedPlatform(_)
+        ));
+        assert!(matches!(
+            map_freebsd_no_replace_error(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::NOSYS.raw_os_error()
+            )),
+            Error::UnsupportedPlatform(_)
+        ));
+        assert!(matches!(
+            map_freebsd_no_replace_error(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::IO.raw_os_error()
+            )),
+            Error::Io { .. }
+        ));
     }
 
     #[test]

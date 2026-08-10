@@ -165,7 +165,9 @@ impl ApprovalDocument {
             Some(evidence) => self.verify_delegated(request, evidence, resolver),
         }
         .map_err(|error| match error {
-            Error::UnauthorizedApproval(_) => error,
+            Error::UnauthorizedApproval(_) | Error::UnsupportedPlatform(_) | Error::Io { .. } => {
+                error
+            }
             other => Error::UnauthorizedApproval(other.to_string()),
         })
     }

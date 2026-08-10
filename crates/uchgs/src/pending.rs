@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     Error, Result,
-    authority_file::{PublishOutcome, TrustedRoot},
+    authority_file::{PublishOutcome, TrustedRoot, is_authority_temporary_name},
     ledger::Ledger,
     wire::{
         APPROVAL_MAX_BYTES, Action, ApprovalDocument, CredentialResolver, Digest32,
@@ -149,14 +149,8 @@ impl<'a> PendingStore<'a> {
                 continue;
             }
             let path = pending_dir(request_id).join(&name);
-            let candidate = match self.root.read_file(&path, APPROVAL_MAX_BYTES) {
-                Ok(bytes) => ApprovalDocument::parse(&bytes).and_then(|approval| {
-                    approval.verify(&request, resolver)?;
-                    Ok(approval)
-                }),
-                Err(error) => Err(error),
-            };
-            let candidate = match candidate {
+            let bytes = self.root.read_file(&path, APPROVAL_MAX_BYTES)?;
+            let candidate = match ApprovalDocument::parse(&bytes) {
                 Ok(candidate) => candidate,
                 Err(_) => {
                     // A failed cleanup must not replace the authorization
@@ -165,6 +159,18 @@ impl<'a> PendingStore<'a> {
                     continue;
                 }
             };
+            match candidate.verify(&request, resolver) {
+                Ok(()) => {}
+                Err(error @ (Error::Io { .. } | Error::UnsupportedPlatform(_))) => {
+                    return Err(error);
+                }
+                Err(_) => {
+                    // Only a proven validation failure makes this candidate
+                    // disposable. Resolver substrate failures remain retryable.
+                    let _ = self.root.remove_file(&path);
+                    continue;
+                }
+            }
             let final_path = pending_approval_path(request_id);
             match self
                 .root
@@ -367,28 +373,46 @@ impl<'a> PendingStore<'a> {
             Err(error) => return Err(error),
         };
         let mut completed = 0;
+        // One unusable directory must not strand the other complete pairs, so the
+        // sweep records the first failure and keeps going. That error is still
+        // returned at the end, so a partially successful sweep reports failure
+        // instead of a success count that hides it.
+        let mut first_error = None;
         for entry in entries {
             let value = entry.to_string_lossy();
-            if value.starts_with(".tmp-") {
+            if is_authority_temporary_name(&entry) {
                 continue;
             }
             let Ok(bytes) = hex::decode(value.as_ref()) else {
-                return Err(Error::AuthorityConflict(format!(
-                    "invalid pending request directory `{value}`"
-                )));
+                first_error.get_or_insert_with(|| {
+                    Error::AuthorityConflict(format!("invalid pending request directory `{value}`"))
+                });
+                continue;
             };
             let Ok(digest_bytes) = <[u8; 32]>::try_from(bytes) else {
-                return Err(Error::AuthorityConflict(format!(
-                    "invalid pending request digest `{value}`"
-                )));
+                first_error.get_or_insert_with(|| {
+                    Error::AuthorityConflict(format!("invalid pending request digest `{value}`"))
+                });
+                continue;
             };
             let request_id = RequestId::from_digest(Digest32::from_bytes(digest_bytes));
-            if self.exists(&pending_approval_path(&request_id))? {
-                self.finalize_judgment(&request_id, resolver)?;
-                completed += 1;
+            match self.exists(&pending_approval_path(&request_id)) {
+                Ok(true) => match self.finalize_judgment(&request_id, resolver) {
+                    Ok(()) => completed += 1,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                },
+                Ok(false) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
-        Ok(completed)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(completed),
+        }
     }
 
     fn load_pending_request(&self, request_id: &RequestId) -> Result<RequestDocument> {
@@ -454,7 +478,7 @@ impl<'a> PendingStore<'a> {
     fn remove_candidate_files(&self, request_id: &RequestId) -> Result<()> {
         for name in self.root.entries(&pending_dir(request_id))? {
             let value = name.to_string_lossy();
-            if value.starts_with("approval-candidate-") || value.starts_with(".tmp-") {
+            if value.starts_with("approval-candidate-") || is_authority_temporary_name(&name) {
                 self.root.remove_file(&pending_dir(request_id).join(name))?;
             }
         }

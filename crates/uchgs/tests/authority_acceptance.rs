@@ -22,9 +22,9 @@ use uchgs::{
     wire::{
         Action, Approval, ApprovalDocument, ApprovalMaterial, AttestContentAction,
         AttestTreeAction, CredentialId, CredentialResolver, DelegationEvidence,
-        DelegationGrantAction, Digest32, ObjectFormatName, PolicyId, PublicCredential,
-        PublicCredentialDocument, RegistryName, RequestDocument, SecureEnclaveP256Credential,
-        SoftwareEd25519Credential, SourceName, UnitDescriptor,
+        DelegationGrantAction, Digest32, ObjectFormatName, PolicyId, PolicyUpdateAction,
+        PublicCredential, PublicCredentialDocument, RegistryName, RequestDocument,
+        SecureEnclaveP256Credential, SoftwareEd25519Credential, SourceName, UnitDescriptor,
     },
 };
 
@@ -60,6 +60,36 @@ impl CredentialResolver for MemoryResolver {
             .get(&(project.to_owned(), credential_id.clone()))
             .cloned()
             .ok_or_else(|| Error::AuthorityNotFound("test credential is not registered".to_owned()))
+    }
+}
+
+struct IoResolver;
+
+impl CredentialResolver for IoResolver {
+    fn resolve(
+        &self,
+        _project: &str,
+        _credential_id: &CredentialId,
+    ) -> uchgs::Result<PublicCredentialDocument> {
+        Err(Error::Io {
+            operation: "resolve test credential",
+            kind: std::io::ErrorKind::PermissionDenied,
+            message: "injected resolver I/O failure".to_owned(),
+        })
+    }
+}
+
+struct UnsupportedResolver;
+
+impl CredentialResolver for UnsupportedResolver {
+    fn resolve(
+        &self,
+        _project: &str,
+        _credential_id: &CredentialId,
+    ) -> uchgs::Result<PublicCredentialDocument> {
+        Err(Error::UnsupportedPlatform(
+            "injected resolver platform failure".to_owned(),
+        ))
     }
 }
 
@@ -342,6 +372,14 @@ fn approval_verifies_exact_request_and_matching_material_only() {
         approval.verify(&other_request, &resolver),
         Err(Error::UnauthorizedApproval(_))
     ));
+    assert!(matches!(
+        approval.verify(&request, &IoResolver),
+        Err(Error::Io { .. })
+    ));
+    assert!(matches!(
+        approval.verify(&request, &UnsupportedResolver),
+        Err(Error::UnsupportedPlatform(_))
+    ));
 
     let mut extra =
         serde_json::from_slice::<serde_json::Value>(approval.bytes()).expect("approval JSON");
@@ -382,7 +420,8 @@ fn p256_material_is_positive_and_cross_type_material_is_rejected() {
     ));
 }
 
-/// SPEC §16 self_contained_01–05; normative source: SPEC §7.3–§7.4, §9.3.
+/// SPEC §16 self_contained_01–05, delegated_restriction_01,
+/// delegate_01, and delegate_06; normative source: SPEC §7.2–§7.4, §9.3.
 #[test]
 fn delegated_approval_is_self_contained_and_registry_anchored() {
     let human_key = SigningKey::from_bytes(&[11; 32]);
@@ -403,25 +442,32 @@ fn delegated_approval_is_self_contained_and_registry_anchored() {
     )
     .expect("valid grant request");
     let grant_approval = direct_approval(&grant_request, &human_key, 20);
+    let delegated_approval_with_grant =
+        |request: &RequestDocument, approved_at: u128, embedded_grant: &ApprovalDocument| {
+            let delegated_signature = delegated_key.sign(&signing_message(request));
+            ApprovalDocument::encode(Approval {
+                approved_at: approved_at.to_string(),
+                credential_id: delegated_credential.id().clone(),
+                delegation: Some(DelegationEvidence {
+                    credential: STANDARD.encode(delegated_credential.bytes()),
+                    grant_approval: STANDARD.encode(embedded_grant.bytes()),
+                    grant_request: STANDARD.encode(grant_request.bytes()),
+                }),
+                kind: "approval".to_owned(),
+                material: ApprovalMaterial::Ed25519 {
+                    signature: hex::encode(delegated_signature.to_bytes()),
+                },
+                request_id: request.id().clone(),
+                request_sha256: request.sha256(),
+                schema: 1,
+            })
+            .expect("valid delegated approval document")
+        };
+    let delegated_approval = |request: &RequestDocument, approved_at: u128| {
+        delegated_approval_with_grant(request, approved_at, &grant_approval)
+    };
     let request = content_request(vec![path_unit(b"src/main.rs")]);
-    let delegated_signature = delegated_key.sign(&signing_message(&request));
-    let approval = ApprovalDocument::encode(Approval {
-        approved_at: "100".to_owned(),
-        credential_id: delegated_credential.id().clone(),
-        delegation: Some(DelegationEvidence {
-            credential: STANDARD.encode(delegated_credential.bytes()),
-            grant_approval: STANDARD.encode(grant_approval.bytes()),
-            grant_request: STANDARD.encode(grant_request.bytes()),
-        }),
-        kind: "approval".to_owned(),
-        material: ApprovalMaterial::Ed25519 {
-            signature: hex::encode(delegated_signature.to_bytes()),
-        },
-        request_id: request.id().clone(),
-        request_sha256: request.sha256(),
-        schema: 1,
-    })
-    .expect("valid delegated approval document");
+    let approval = delegated_approval(&request, 100);
 
     let registered = MemoryResolver::with(PROJECT, software_credential(&human_key));
     approval
@@ -431,6 +477,57 @@ fn delegated_approval_is_self_contained_and_registry_anchored() {
         approval.verify(&request, &MemoryResolver::default()),
         Err(Error::UnauthorizedApproval(_))
     ));
+    let delegated_grant_approval = delegated_approval(&grant_request, 100);
+    let nested_grant_approval =
+        delegated_approval_with_grant(&request, 100, &delegated_grant_approval);
+    assert!(matches!(
+        nested_grant_approval.verify(&request, &registered),
+        Err(Error::UnauthorizedApproval(_))
+    ));
+
+    let Action::AttestContent(mut out_of_scope_action) = request.request().action.clone() else {
+        panic!("attest-content request")
+    };
+    out_of_scope_action.scope = "different-scope".to_owned();
+    let out_of_scope = RequestDocument::new(
+        PROJECT.to_owned(),
+        Action::AttestContent(out_of_scope_action),
+    )
+    .expect("out-of-scope request");
+    assert!(matches!(
+        delegated_approval(&out_of_scope, 100).verify(&out_of_scope, &registered),
+        Err(Error::UnauthorizedApproval(_))
+    ));
+    for approved_at in [9, 200] {
+        assert!(matches!(
+            delegated_approval(&request, approved_at).verify(&request, &registered),
+            Err(Error::UnauthorizedApproval(_))
+        ));
+    }
+    for approved_at in [10, 199] {
+        delegated_approval(&request, approved_at)
+            .verify(&request, &registered)
+            .expect("half-open grant boundary accepts its interior");
+    }
+
+    let policy_update = RequestDocument::new(
+        PROJECT.to_owned(),
+        Action::PolicyUpdate(PolicyUpdateAction {
+            config_id: Digest32::from_bytes([4; 32]),
+            config_length: 1,
+            expected_active: None,
+            note: "update policy".to_owned(),
+        }),
+    )
+    .expect("policy-update request");
+    let signer_enroll =
+        signer_enroll_request(&delegated_credential, "delegated", RegistryName::Repository);
+    for direct_only in [&grant_request, &policy_update, &signer_enroll] {
+        assert!(matches!(
+            delegated_approval(direct_only, 100).verify(direct_only, &registered),
+            Err(Error::UnauthorizedApproval(_))
+        ));
+    }
     assert!(
         direct_approval(&request, &human_key, 100)
             .approval()
@@ -470,18 +567,35 @@ fn invalid_candidate_does_not_block_a_later_valid_winner() {
 
     let wrong_key = SigningKey::from_bytes(&[22; 32]);
     let invalid = direct_approval(&request, &wrong_key, 100);
-    store
+    let invalid_path = store
         .stage_approval_candidate(request.id(), invalid.bytes())
         .expect("stage invalid candidate");
     assert!(matches!(
         store.accept_candidates(request.id(), &resolver),
         Err(Error::AuthorityNotFound(_))
     ));
+    assert!(!directory.path().join(invalid_path).exists());
 
     let valid = direct_approval(&request, &key, 100);
-    store
+    let valid_path = store
         .stage_approval_candidate(request.id(), valid.bytes())
         .expect("stage valid candidate");
+    fs::write(
+        directory.path().join(&valid_path),
+        vec![b'x'; uchgs::wire::APPROVAL_MAX_BYTES + 1],
+    )
+    .expect("inject bounded-read failure");
+    assert!(matches!(
+        store.accept_candidates(request.id(), &resolver),
+        Err(Error::EncodedLengthExceeded { .. })
+    ));
+    assert!(directory.path().join(&valid_path).is_file());
+    fs::write(directory.path().join(&valid_path), valid.bytes()).expect("restore valid candidate");
+    assert!(matches!(
+        store.accept_candidates(request.id(), &IoResolver),
+        Err(Error::Io { .. })
+    ));
+    assert!(directory.path().join(&valid_path).is_file());
     let winner = store
         .accept_candidates(request.id(), &resolver)
         .expect("accept valid candidate");
@@ -585,6 +699,40 @@ fn multi_unit_finalization_is_idempotent_and_crash_reconcilable() {
                 .is_file()
         );
     }
+
+    let malformed = directory.path().join("pending/v1/sha256/!malformed");
+    fs::create_dir_all(&malformed).expect("malformed pending entry");
+    let later_request = content_request(vec![path_unit(b"later")]);
+    let later_approval = direct_approval(&later_request, &key, 101);
+    store
+        .publish_request(&later_request)
+        .expect("publish later request");
+    store
+        .stage_approval_candidate(later_request.id(), later_approval.bytes())
+        .expect("stage later approval");
+    store
+        .accept_candidates(later_request.id(), &resolver)
+        .expect("accept later approval");
+    assert!(matches!(
+        store.reconcile_judgments(&resolver),
+        Err(Error::AuthorityConflict(_))
+    ));
+    assert!(malformed.is_dir());
+    assert!(
+        directory
+            .path()
+            .join(format!(
+                "approvals/v1/sha256/{}/request.json",
+                later_request.sha256()
+            ))
+            .is_file()
+    );
+    assert!(
+        !directory
+            .path()
+            .join(format!("pending/v1/sha256/{}", later_request.sha256()))
+            .exists()
+    );
 }
 
 /// SPEC §6.3 and §16 key_03/approval_06; normative source: SPEC §6.3, §7.6.
@@ -812,7 +960,7 @@ fn registry_resolves_only_complete_authorized_enrollment_bundles() {
         "first",
         RegistryName::Repository,
     );
-    install_enrollment_bundle(
+    let first_bundle = install_enrollment_bundle(
         repository_dir.path(),
         &first_request,
         &first_approval,
@@ -839,6 +987,11 @@ fn registry_resolves_only_complete_authorized_enrollment_bundles() {
         &second_credential,
         &second_enrollment,
     );
+    fs::write(
+        first_bundle.join(".tmp-authority-999-1-enrollment.json"),
+        b"interrupted publication",
+    )
+    .expect("recognized temporary residue");
 
     let global = TrustedRoot::open(global_dir.path()).expect("global root");
     let repository = TrustedRoot::open(repository_dir.path()).expect("repository root");
@@ -847,6 +1000,26 @@ fn registry_resolves_only_complete_authorized_enrollment_bundles() {
         .expect("fixed-point enrollment chain");
     assert_eq!(resolved.principal, "second");
     assert_eq!(resolved.credential.bytes(), second_credential.bytes());
+
+    let similar_unknown = first_bundle.join(".tmpx-authority-999-1-enrollment.json");
+    fs::write(&similar_unknown, b"unknown").expect("similar unknown entry");
+    assert!(matches!(
+        Registry::new(&global, &repository).resolve_full(PROJECT, second_credential.id()),
+        Err(Error::AuthorityConflict(_))
+    ));
+    fs::remove_file(similar_unknown).expect("remove similar unknown entry");
+    let malformed_temporary = first_bundle.join(".tmp-garbage");
+    fs::write(&malformed_temporary, b"unknown").expect("malformed temporary entry");
+    assert!(matches!(
+        Registry::new(&global, &repository).resolve_full(PROJECT, second_credential.id()),
+        Err(Error::AuthorityConflict(_))
+    ));
+    fs::remove_file(malformed_temporary).expect("remove malformed temporary entry");
+    fs::write(first_bundle.join("unknown"), b"unknown").expect("arbitrary unknown entry");
+    assert!(matches!(
+        Registry::new(&global, &repository).resolve_full(PROJECT, second_credential.id()),
+        Err(Error::AuthorityConflict(_))
+    ));
 }
 
 /// Reviewer exact4 registry failures; normative source: SPEC §8.1–§8.4.
