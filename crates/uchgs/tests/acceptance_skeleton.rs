@@ -54,12 +54,7 @@ acceptance_skeleton!(
     "SPEC §3.3, §6.2"
 );
 
-// SPEC §16「project」; normative rules: SPEC §5.2, §5.5, §6.2–§6.3.
-acceptance_skeleton!(
-    project_01_policy_update_rejects_project_change,
-    "候補 config の project が現 ACTIVE と違えば policy 更新が失敗する",
-    "SPEC §5.2, §5.5"
-);
+// SPEC §16「project」の policy 更新項目は policy_acceptance.rs で解禁済み。
 acceptance_skeleton!(
     project_02_judgment_records_have_no_project_field,
     "判定の記録に project 欄が無い",
@@ -456,27 +451,7 @@ acceptance_skeleton!(
 
 // SPEC §16「承認」7項目は authority_acceptance.rs で解禁済み。
 
-// SPEC §16「設定」; normative rules: SPEC §5.
-acceptance_skeleton!(
-    policy_01_config_has_only_scope_name_type_and_gate_requirements,
-    "設定には観点名・型・gate要求だけがあり対象選択欄が無い",
-    "SPEC §5.2–§5.4"
-);
-acceptance_skeleton!(
-    policy_02_active_mismatch_fails,
-    "期待ACTIVEとの不一致を拒否する",
-    "SPEC §5.5"
-);
-acceptance_skeleton!(
-    policy_03_old_bundle_is_removed_after_activation,
-    "有効化直後に古いbundleを消す",
-    "SPEC §5.5"
-);
-acceptance_skeleton!(
-    policy_04_old_judgments_survive_policy_change,
-    "policy変更後も過去判定を有効とする",
-    "SPEC §5.5, §6"
-);
+// SPEC §16「設定」4項目は policy_acceptance.rs で解禁済み。
 
 // SPEC §16「鍵の登録」; normative rules: SPEC §8.
 // registry_01–02 は ceremony.rs、registry_03–05 は
@@ -488,22 +463,7 @@ acceptance_skeleton!(
     "SPEC §8.6"
 );
 
-// SPEC §16「policy の同一性」; normative rules: SPEC §5.5.
-acceptance_skeleton!(
-    policy_identity_01_active_directory_and_request_digest_match,
-    "ACTIVE digest・bundle名・SHA-256(request.json)が一致する",
-    "SPEC §5.5"
-);
-acceptance_skeleton!(
-    policy_identity_02_config_id_matches_config_digest,
-    "request config_id不一致をpolicy-invalidにする",
-    "SPEC §5.5"
-);
-acceptance_skeleton!(
-    policy_identity_03_any_bundle_substitution_fails,
-    "bundleの3点いずれの差替えも読込失敗にする",
-    "SPEC §5.5"
-);
+// SPEC §16「policy の同一性」3項目は policy_acceptance.rs で解禁済み。
 
 // SPEC §16「delegate」; normative rules: SPEC §9.
 // delegate_02 と delegate_07 は delegate.rs で解禁済み。

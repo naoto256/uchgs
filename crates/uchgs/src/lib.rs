@@ -6,6 +6,7 @@ mod error;
 pub mod extract;
 pub mod ledger;
 pub mod pending;
+pub mod policy;
 pub mod registry;
 pub mod signer;
 pub mod software_key;

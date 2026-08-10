@@ -464,9 +464,9 @@ impl TrustedRoot {
     }
 
     /// Publishes one complete authority file through a same-directory temporary
-    /// file. `replace` is reserved for the ledger append exception in §6.4.
+    /// file. `replace` is reserved for ACTIVE and the ledger append exceptions.
     ///
-    /// Normative source: SPEC §6.4 and §14.2.
+    /// Normative source: SPEC §5.5, §6.4, and §14.2.
     pub(crate) fn publish_file(
         &self,
         relative: &Path,
@@ -576,6 +576,24 @@ impl TrustedRoot {
         parent
             .remove_file(Path::new(&name))
             .map_err(|error| Error::io("remove authority file", error))?;
+        #[cfg(not(windows))]
+        Self::sync_dir(&parent)?;
+        Ok(())
+    }
+
+    /// Removes one empty authority directory through its validated parent.
+    ///
+    /// Callers must first validate and remove the directory's exact closed
+    /// contents. This deliberately provides no recursive deletion primitive.
+    ///
+    /// Normative source: SPEC §5.5 and §14.2.
+    pub(crate) fn remove_empty_directory(&self, relative: &Path) -> Result<()> {
+        self.require_writable_authority_filesystem()?;
+        let (parent_path, name) = split_file_path(relative)?;
+        let parent = self.open_dir(&parent_path)?;
+        parent
+            .remove_dir(Path::new(&name))
+            .map_err(|error| Error::io("remove empty authority directory", error))?;
         #[cfg(not(windows))]
         Self::sync_dir(&parent)?;
         Ok(())
@@ -705,6 +723,16 @@ impl TrustedRoot {
         Self::sync_dir(&directory)
     }
 
+    /// Best-effort removal of generated temporary residue in one authority
+    /// directory. The shared §14.2 recognizer remains the only name grammar.
+    ///
+    /// Normative source: SPEC §5.5 and §14.2.
+    pub(crate) fn cleanup_temporary_entries(&self, relative: &Path) -> Result<()> {
+        self.require_writable_authority_filesystem()?;
+        let directory = self.open_dir(relative)?;
+        self.cleanup_foreign_temporaries(&directory)
+    }
+
     pub(crate) fn same_root(&self, other: &Self) -> Result<bool> {
         let this = self
             .dir
@@ -741,7 +769,8 @@ impl TrustedRoot {
             .entries()
             .map_err(|error| Error::io("list authority temporary files", error))?;
         for entry in entries {
-            let Ok(entry) = entry else { continue };
+            let entry = entry
+                .map_err(|error| Error::io("read authority temporary directory entry", error))?;
             let name = entry.file_name();
             let display = name.to_string_lossy();
             if is_authority_temporary_name(&name)
