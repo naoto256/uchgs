@@ -19,12 +19,12 @@ use zeroize::Zeroizing;
 
 use crate::{
     Error, Result,
-    authority_file::{TrustedRoot, is_authority_temporary_name},
+    authority_file::TrustedRoot,
     pending::PendingStore,
     signer::wall_clock_nanos,
     wire::{
         Action, Approval, ApprovalDocument, ApprovalMaterial, CredentialResolver,
-        DelegationEvidence, DelegationGrantAction, PolicyId, PublicCredential,
+        DelegationEvidence, DelegationGrantAction, Digest32, PolicyId, PublicCredential,
         PublicCredentialDocument, REQUEST_MAX_BYTES, RequestDocument, RequestId,
         SoftwareEd25519Credential, signing_message,
     },
@@ -116,6 +116,7 @@ impl PendingDelegation {
             credential: self.credential,
             grant_approval,
             grant_request: self.grant_request,
+            retired: false,
             seed: self.seed,
             staged_requests: BTreeSet::new(),
         })
@@ -127,6 +128,7 @@ pub struct DelegateSession {
     credential: PublicCredentialDocument,
     grant_approval: ApprovalDocument,
     grant_request: RequestDocument,
+    retired: bool,
     seed: Zeroizing<[u8; 32]>,
     staged_requests: BTreeSet<RequestId>,
 }
@@ -172,24 +174,25 @@ impl DelegateSession {
         repository: &TrustedRoot,
         termination: &DelegateTermination,
     ) -> Result<DelegateExit> {
+        self.require_active()?;
         loop {
             if termination.requested() {
-                self.seed.fill(0);
+                self.retire();
                 return Ok(DelegateExit::Signal);
             }
             match self.is_expired() {
                 Ok(true) => {
-                    self.seed.fill(0);
+                    self.retire();
                     return Ok(DelegateExit::Expired);
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    self.seed.fill(0);
+                    self.retire();
                     return Err(error);
                 }
             }
             if let Err(error) = self.process_pending(repository) {
-                self.seed.fill(0);
+                self.retire();
                 return Err(error);
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -199,9 +202,26 @@ impl DelegateSession {
     /// Discovers pending requests through the sole §9.4 filesystem channel and
     /// stages approvals for every currently eligible request.
     pub fn process_pending(&mut self, repository: &TrustedRoot) -> Result<usize> {
-        if self.is_expired()? {
-            return Ok(0);
+        self.require_active()?;
+        match self.is_expired() {
+            Ok(true) => {
+                self.retire();
+                return Ok(0);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.retire();
+                return Err(error);
+            }
         }
+        let result = self.process_pending_active(repository);
+        if result.is_err() {
+            self.retire();
+        }
+        result
+    }
+
+    fn process_pending_active(&mut self, repository: &TrustedRoot) -> Result<usize> {
         let entries = match repository.entries(Path::new("pending/v1/sha256")) {
             Ok(entries) => entries,
             Err(Error::Io {
@@ -214,22 +234,18 @@ impl DelegateSession {
         let mut completed = 0;
         let mut first_error = None;
         for entry in entries {
-            if is_authority_temporary_name(&entry) {
+            let Some(digest) = entry.to_str() else {
                 continue;
-            }
-            let digest = entry.to_string_lossy();
-            let request_id = match RequestId::from_str(&format!("request/v1/sha256/{digest}")) {
-                Ok(value) => value,
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                    continue;
-                }
             };
+            let Ok(digest) = Digest32::from_str(digest) else {
+                continue;
+            };
+            let request_id = RequestId::from_digest(digest);
             if self.staged_requests.contains(&request_id) {
                 continue;
             }
             let request_path = Path::new("pending/v1/sha256")
-                .join(digest.as_ref())
+                .join(&entry)
                 .join("request.json");
             let bytes = match repository.read_file(&request_path, REQUEST_MAX_BYTES) {
                 Ok(bytes) => bytes,
@@ -285,6 +301,7 @@ impl DelegateSession {
         request: &RequestDocument,
         approved_at: u128,
     ) -> Result<ApprovalDocument> {
+        self.require_active()?;
         if !self.eligible(request, approved_at) {
             return Err(Error::UnauthorizedApproval(
                 "request is outside delegated authority".to_owned(),
@@ -347,6 +364,28 @@ impl DelegateSession {
 
     fn expires_at(&self) -> Result<u128> {
         self.interval().map(|(_, end)| end)
+    }
+
+    fn require_active(&self) -> Result<()> {
+        if self.retired {
+            return Err(Error::UnauthorizedApproval(
+                "delegated authority is retired".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ends this session's authority: the seed is zeroized and every later
+    /// authority-bearing operation is refused.
+    ///
+    /// Zeroizing alone would not end it. `SigningKey::from_bytes` accepts an
+    /// all-zero seed, so a session that only wiped its seed would keep signing under
+    /// a key anyone can derive. The flag is what makes retirement final, and every
+    /// exit path — expiry, signal, or any processing error — takes it, so a fault
+    /// cannot leave a half-trusted session running.
+    fn retire(&mut self) {
+        self.seed.fill(0);
+        self.retired = true;
     }
 }
 
@@ -538,6 +577,11 @@ mod tests {
             DelegateExit::Expired
         );
         assert_eq!(&*session.seed, &[0; 32]);
+        assert!(session.retired);
+        assert!(matches!(
+            session.process_pending(&root),
+            Err(Error::UnauthorizedApproval(_))
+        ));
     }
 
     #[test]
@@ -568,6 +612,11 @@ mod tests {
             DelegateExit::Signal
         );
         assert_eq!(&*session.seed, &[0; 32]);
+        assert!(session.retired);
+        assert!(matches!(
+            session.approval_at(&content_request(), now_nanos().unwrap()),
+            Err(Error::UnauthorizedApproval(_))
+        ));
     }
 
     #[test]
@@ -597,5 +646,48 @@ mod tests {
         let root = TrustedRoot::open(temp.path()).unwrap();
         assert!(session.run_foreground(&root, &termination).is_err());
         assert_eq!(&*session.seed, &[0; 32]);
+        assert!(session.retired);
+        assert!(matches!(
+            session.process_pending(&root),
+            Err(Error::UnauthorizedApproval(_))
+        ));
+    }
+
+    #[test]
+    fn delegate_pending_scan_skips_only_non_digest_entry_names() {
+        let human_key = SigningKey::from_bytes(&[19; 32]);
+        let human_credential = credential(&human_key);
+        let resolver = Resolver(BTreeMap::from([(
+            human_credential.id().clone(),
+            human_credential,
+        )]));
+        let pending = PendingDelegation::new(
+            "example/project".to_owned(),
+            PolicyId::from_digest(Digest32::from_bytes([9; 32])),
+            vec!["security".to_owned()],
+            Duration::from_secs(60),
+            "strict pending names".to_owned(),
+        )
+        .unwrap();
+        let approval = direct_approval(pending.request(), &human_key);
+        let mut session = pending.activate(approval, &resolver).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let pending_root = temp.path().join("pending/v1/sha256");
+        fs::create_dir_all(pending_root.join("not-a-request-digest")).unwrap();
+        let root = TrustedRoot::open(temp.path()).unwrap();
+
+        assert_eq!(session.process_pending(&root).unwrap(), 0);
+        assert!(!session.retired);
+
+        let valid_digest = Digest32::from_bytes([0xaa; 32]).to_hex();
+        fs::create_dir(pending_root.join(valid_digest)).unwrap();
+        assert!(matches!(
+            session.process_pending(&root),
+            Err(Error::Io {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            })
+        ));
+        assert!(session.retired);
     }
 }

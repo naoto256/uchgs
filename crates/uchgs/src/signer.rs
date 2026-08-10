@@ -443,11 +443,19 @@ mod tests {
         save_software_key(&real_key, &envelope).unwrap();
 
         let linked_parent = root.join("linked-parent");
-        symlink_dir(&real_parent, &linked_parent).unwrap();
-        assert!(save_software_key(linked_parent.join("new.key"), &envelope).is_err());
+        match symlink_dir(&real_parent, &linked_parent) {
+            Ok(()) => {
+                assert!(save_software_key(linked_parent.join("new.key"), &envelope).is_err())
+            }
+            Err(error) if error.raw_os_error() == Some(1314) => {}
+            Err(error) => panic!("create directory symlink for reparse test: {error}"),
+        }
 
         let linked_key = root.join("linked.key");
-        symlink_file(&real_key, &linked_key).unwrap();
-        assert!(load_software_key(&linked_key).is_err());
+        match symlink_file(&real_key, &linked_key) {
+            Ok(()) => assert!(load_software_key(&linked_key).is_err()),
+            Err(error) if error.raw_os_error() == Some(1314) => {}
+            Err(error) => panic!("create file symlink for reparse test: {error}"),
+        }
     }
 }
