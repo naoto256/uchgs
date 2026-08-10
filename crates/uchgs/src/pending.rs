@@ -117,6 +117,37 @@ impl<'a> PendingStore<'a> {
         }
     }
 
+    /// Builds and publishes a delegated candidate while holding the pending
+    /// lock, so the approval timestamp is observed only after that lock is held.
+    ///
+    /// Normative source: SPEC §9.3 step 4 and §7.5 step 3.
+    pub(crate) fn stage_delegated_candidate(
+        &self,
+        request_id: &RequestId,
+        build: impl FnOnce(&RequestDocument) -> Result<ApprovalDocument>,
+    ) -> Result<PathBuf> {
+        let _lock = self.root.lock(".pending.lock")?;
+        let request = self.load_pending_request(request_id)?;
+        if self.exists(&terminal_request_path(request_id))? {
+            return Err(Error::AuthorityConflict(format!(
+                "request {request_id} is terminal"
+            )));
+        }
+        let approval = build(&request)?;
+        ApprovalDocument::parse(approval.bytes())?;
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce)
+            .map_err(|error| Error::field("approval_candidate", error.to_string()))?;
+        let path =
+            pending_dir(request_id).join(format!("approval-candidate-{}.json", hex::encode(nonce)));
+        match self.root.publish_file(&path, approval.bytes(), false)? {
+            PublishOutcome::Published => Ok(path),
+            PublishOutcome::Existing => Err(Error::AuthorityConflict(
+                "random approval candidate name collided".to_owned(),
+            )),
+        }
+    }
+
     /// Selects the first valid candidate under the pending lock. Invalid
     /// candidates are removed and cannot poison a later valid candidate.
     ///
@@ -319,6 +350,53 @@ impl<'a> PendingStore<'a> {
                 self.verify_archived_judgments(&saved_request, resolver)?;
                 Ok(())
             }
+            PublishOutcome::Existing => Err(Error::AuthorityConflict(format!(
+                "approval destination for {request_id} already exists"
+            ))),
+        }
+    }
+
+    /// Archives a verified non-judgment request/approval pair after its durable
+    /// authority effect has been independently confirmed by the caller.
+    ///
+    /// Normative source: SPEC §7.6 and §8.3.
+    pub(crate) fn archive_verified_pair(
+        &self,
+        request: &RequestDocument,
+        approval: &ApprovalDocument,
+        resolver: &impl CredentialResolver,
+    ) -> Result<()> {
+        let request_id = request.id();
+        let _pending_lock = self.root.lock(".pending.lock")?;
+        if self.exists(&approved_request_path(request_id))? {
+            let (saved_request, saved_approval) = self.load_approved_pair(request_id)?;
+            if saved_request.bytes() != request.bytes()
+                || saved_approval.bytes() != approval.bytes()
+            {
+                return Err(Error::AuthorityConflict(
+                    "archived approval pair differs from the completed operation".to_owned(),
+                ));
+            }
+            saved_approval.verify(&saved_request, resolver)?;
+            return Ok(());
+        }
+        let saved_request = self.load_pending_request(request_id)?;
+        let saved_approval = self.load_pending_approval(request_id)?.ok_or_else(|| {
+            Error::AuthorityNotFound(format!("approval.json is absent for {request_id}"))
+        })?;
+        if saved_request.bytes() != request.bytes() || saved_approval.bytes() != approval.bytes() {
+            return Err(Error::AuthorityConflict(
+                "pending approval pair differs from the completed operation".to_owned(),
+            ));
+        }
+        saved_approval.verify(&saved_request, resolver)?;
+        self.remove_candidate_files(request_id)?;
+        self.verify_pending_pair_contents(request_id)?;
+        match self
+            .root
+            .rename_directory_no_replace(&pending_dir(request_id), &approved_dir(request_id))?
+        {
+            PublishOutcome::Published => Ok(()),
             PublishOutcome::Existing => Err(Error::AuthorityConflict(format!(
                 "approval destination for {request_id} already exists"
             ))),

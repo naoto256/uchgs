@@ -260,7 +260,7 @@ fn verify_request_binding(approval: &Approval, request: &RequestDocument) -> Res
     Ok(())
 }
 
-fn signing_message(request_bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn signing_message(request_bytes: &[u8]) -> Vec<u8> {
     let mut message = b"uchgs-approval-v1\0".to_vec();
     message.extend_from_slice(&Sha256::digest(request_bytes));
     message

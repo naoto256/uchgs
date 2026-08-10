@@ -5,6 +5,7 @@ mod id;
 mod request;
 pub(crate) mod validation;
 
+pub(crate) use approval::signing_message;
 pub use approval::{
     Approval, ApprovalDocument, ApprovalMaterial, CredentialResolver, DelegationEvidence,
 };

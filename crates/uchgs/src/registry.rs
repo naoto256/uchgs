@@ -67,11 +67,20 @@ impl GenesisDocument {
         let id = GenesisId::from_digest(Digest32::from_bytes(exact.sha256()));
         Ok(Self { exact, id })
     }
+    /// Encodes the exact closed genesis document from SPEC §8.4.
+    pub fn encode(genesis: Genesis) -> Result<Self> {
+        let exact = ExactJson::encode(genesis, REGISTRY_DOCUMENT_MAX_BYTES)?;
+        let id = GenesisId::from_digest(Digest32::from_bytes(exact.sha256()));
+        Ok(Self { exact, id })
+    }
     pub fn genesis(&self) -> &Genesis {
         self.exact.value()
     }
     pub fn id(&self) -> &GenesisId {
         &self.id
+    }
+    pub fn bytes(&self) -> &[u8] {
+        self.exact.bytes()
     }
 }
 
@@ -110,6 +119,40 @@ struct EnrollmentPreimage<'a> {
 }
 
 impl Enrollment {
+    /// Constructs the self-identifying exact §8.4 enrollment value.
+    pub fn from_authority(
+        request: &RequestDocument,
+        approval: &ApprovalDocument,
+        credential: &PublicCredentialDocument,
+    ) -> Result<Self> {
+        let Action::SignerEnroll(action) = &request.request().action else {
+            return Err(Error::field(
+                "enrollment",
+                "request action must be signer-enroll",
+            ));
+        };
+        let mut enrollment = Self {
+            active_policy_sha256: action.policy.digest(),
+            approval_sha256: approval.sha256(),
+            credential_id: credential.id().clone(),
+            credential_length: credential.bytes().len() as u64,
+            credential_sha256: credential.sha256(),
+            enrollment_id: Digest32::from_bytes([0; 32]),
+            kind: "uchgs-enrollment".to_owned(),
+            principal: action.principal.clone(),
+            project: request.request().project.clone(),
+            registry: action.registry,
+            request_id: request.id().clone(),
+            request_sha256: request.sha256(),
+            schema: 1,
+        };
+        let bytes = serde_json_canonicalizer::to_vec(&enrollment.preimage())
+            .map_err(|error| Error::InvalidJson(error.to_string()))?;
+        enrollment.enrollment_id = Digest32::from_bytes(Sha256::digest(bytes).into());
+        enrollment.validate()?;
+        Ok(enrollment)
+    }
+
     fn preimage(&self) -> EnrollmentPreimage<'_> {
         EnrollmentPreimage {
             active_policy_sha256: self.active_policy_sha256,
@@ -174,8 +217,16 @@ impl EnrollmentDocument {
             exact: ExactJson::parse(bytes, REGISTRY_DOCUMENT_MAX_BYTES)?,
         })
     }
+    pub fn encode(enrollment: Enrollment) -> Result<Self> {
+        Ok(Self {
+            exact: ExactJson::encode(enrollment, REGISTRY_DOCUMENT_MAX_BYTES)?,
+        })
+    }
     pub fn enrollment(&self) -> &Enrollment {
         self.exact.value()
+    }
+    pub fn bytes(&self) -> &[u8] {
+        self.exact.bytes()
     }
 }
 
