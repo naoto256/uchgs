@@ -1,2 +1,7 @@
 /target
 /spec-mirror/
+.env
+*.db
+*.pem
+*.key
+*.p12
