@@ -791,6 +791,56 @@ message\n";
         );
         assert!(rendered.replace("file", "state").parse::<UnitId>().is_err());
         assert!(rendered.to_ascii_uppercase().parse::<UnitId>().is_err());
+        let digest = rendered
+            .rsplit_once('/')
+            .expect("digest segment")
+            .1
+            .to_ascii_uppercase();
+        assert!(
+            format!("{UNIT_ID_PREFIX}file/{digest}")
+                .parse::<UnitId>()
+                .is_err()
+        );
+    }
+
+    /// SPEC §3.2 fixes the tag header order, target type set, and normalized bytes.
+    #[test]
+    fn tag_headers_are_ordered_typed_and_normalized() {
+        let valid = b"object 0000000000000000000000000000000000000000\n\
+type commit\n\
+tag v1\n\
+tagger T <t@x> 5 -0500\n\
+\n\
+notes\n";
+        let units =
+            extract_git_object(ObjectFormat::Sha1, &frame("tag", valid)).expect("valid tag object");
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].kind(), UnitKind::Tag);
+        assert_eq!(units[0].bytes(), b"tag v1\ntagger T <t@x>\n\nnotes\n");
+
+        for invalid in [
+            b"type commit\n\
+object 0000000000000000000000000000000000000000\n\
+tag v1\n\
+tagger T <t@x> 5 -0500\n\
+\n\
+notes\n"
+                .as_slice(),
+            b"object 0000000000000000000000000000000000000000\n\
+type note\n\
+tag v1\n\
+tagger T <t@x> 5 -0500\n\
+\n\
+notes\n",
+            b"object 0000000000000000000000000000000000000000\n\
+type commit\n\
+tag \n\
+tagger T <t@x> 5 -0500\n\
+\n\
+notes\n",
+        ] {
+            assert!(extract_git_object(ObjectFormat::Sha1, &frame("tag", invalid)).is_err());
+        }
     }
 
     /// SPEC §3.3 applies the exact closed ref-name grammar.
