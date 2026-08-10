@@ -89,14 +89,27 @@ impl<'a> PendingStore<'a> {
     /// Loads the exact request bytes retained by the pending transport.
     ///
     /// Policy activation uses this crate-private seam to resume the same
-    /// approved operation without duplicating the §7.5 path grammar.
+    /// approved operation without duplicating the §7.5 path grammar. The
+    /// complete approved/terminal/pending lookup is serialized with timeout
+    /// transitions so no intermediate `NotFound` escapes as an I/O failure.
     ///
     /// Normative source: SPEC §5.5 and §7.5–§7.6.
     pub(crate) fn load_retained_request(&self, request_id: &RequestId) -> Result<RequestDocument> {
+        let _lock = self.root.lock(".pending.lock")?;
         if self.exists(&approved_request_path(request_id))? {
             return Ok(self.load_approved_pair(request_id)?.0);
         }
-        self.load_pending_request(request_id)
+        if self.exists(&terminal_request_path(request_id))? {
+            return Err(Error::AuthorityConflict(format!(
+                "request {request_id} is terminal"
+            )));
+        }
+        if self.exists(&pending_request_path(request_id))? {
+            return self.load_pending_request(request_id);
+        }
+        Err(Error::AuthorityNotFound(format!(
+            "retained request {request_id} does not exist"
+        )))
     }
 
     /// Publishes one signed approval candidate under a non-final name.
@@ -618,4 +631,65 @@ fn approved_request_path(request_id: &RequestId) -> PathBuf {
 }
 fn approved_approval_path(request_id: &RequestId) -> PathBuf {
     approved_dir(request_id).join("approval.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, mpsc},
+        thread,
+        time::Duration,
+    };
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::wire::PolicyUpdateAction;
+
+    /// A timeout rename and retained-request lookup share one lock boundary,
+    /// so lookup observes either the retained request or a typed terminal
+    /// state, never a raw `NotFound` from between those states.
+    ///
+    /// Normative source: SPEC §5.5, §7.5, and §14.1.
+    #[test]
+    fn retained_request_lookup_serializes_with_timeout_rename() {
+        let directory = tempdir().unwrap();
+        let root = Arc::new(TrustedRoot::open(directory.path()).unwrap());
+        let request = RequestDocument::new(
+            "demo".to_owned(),
+            Action::PolicyUpdate(PolicyUpdateAction {
+                config_id: Digest32::from_bytes([0x11; 32]),
+                config_length: 1,
+                expected_active: None,
+                note: "test timeout transition".to_owned(),
+            }),
+        )
+        .unwrap();
+        let handle = PendingStore::new(&root).publish_request(&request).unwrap();
+        let request_id = handle.request_id().clone();
+
+        let lock = root.lock(".pending.lock").unwrap();
+        let worker_root = Arc::clone(&root);
+        let worker_id = request_id.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            sender
+                .send(PendingStore::new(&worker_root).load_retained_request(&worker_id))
+                .unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+
+        match root
+            .rename_directory_no_replace(&pending_dir(&request_id), &terminal_dir(&request_id))
+            .unwrap()
+        {
+            PublishOutcome::Published => {}
+            PublishOutcome::Existing => panic!("terminal directory unexpectedly existed"),
+        }
+        drop(lock);
+
+        let result = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(result, Err(Error::AuthorityConflict(_))));
+        worker.join().unwrap();
+    }
 }

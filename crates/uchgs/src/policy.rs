@@ -16,8 +16,8 @@ use crate::{
     authority_file::{PublishOutcome, TrustedRoot, is_authority_temporary_name},
     pending::{PendingHandle, PendingStore},
     wire::{
-        Action, ApprovalDocument, CredentialResolver, Digest32, PolicyId, PolicyUpdateAction,
-        RequestDocument, RequestId, validation,
+        APPROVAL_MAX_BYTES, Action, ApprovalDocument, CredentialResolver, Digest32, PolicyId,
+        PolicyUpdateAction, REQUEST_MAX_BYTES, RequestDocument, RequestId, validation,
     },
 };
 
@@ -355,21 +355,16 @@ impl<'a> PolicyStore<'a> {
         approval: &ApprovalDocument,
     ) -> Result<()> {
         let directory = bundle_path(id);
-        for (name, bytes) in [
-            ("config.toml", config.bytes()),
-            ("request.json", request.bytes()),
-            ("approval.json", approval.bytes()),
+        for (name, bytes, maximum) in [
+            ("config.toml", config.bytes(), CONFIG_MAX_BYTES),
+            ("request.json", request.bytes(), REQUEST_MAX_BYTES),
+            ("approval.json", approval.bytes(), APPROVAL_MAX_BYTES),
         ] {
             let path = directory.join(name);
             match self.root.publish_file(&path, bytes, false)? {
                 PublishOutcome::Published => {}
                 PublishOutcome::Existing => {
-                    let existing = self.root.read_file(&path, bytes.len())?;
-                    if existing != bytes {
-                        return Err(Error::AuthorityConflict(format!(
-                            "policy bundle file {name} conflicts with the approved bytes"
-                        )));
-                    }
+                    verify_existing_bundle_file(self.root, &path, name, bytes, maximum)?
                 }
             }
         }
@@ -590,6 +585,27 @@ fn verify_request_project(config: &PolicyConfig, request: &RequestDocument) -> R
     Ok(())
 }
 
+/// Verifies an existing no-replace winner without sizing the read from the
+/// approved bytes. The artifact's wire cap is the only safe bound: a longer
+/// residue is a conflict, not an I/O failure and not an idempotent winner.
+///
+/// Normative source: SPEC §5.1, §5.5, and §14.1–§14.2.
+fn verify_existing_bundle_file(
+    root: &TrustedRoot,
+    path: &Path,
+    name: &str,
+    expected: &[u8],
+    maximum: usize,
+) -> Result<()> {
+    match root.read_file(path, maximum) {
+        Ok(existing) if existing == expected => Ok(()),
+        Ok(_) | Err(Error::EncodedLengthExceeded { .. }) => Err(Error::AuthorityConflict(format!(
+            "policy bundle file {name} conflicts with the approved bytes"
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
 fn bundle_path(id: &PolicyId) -> PathBuf {
     Path::new(BUNDLES_PATH).join(id.digest().to_hex())
 }
@@ -603,5 +619,42 @@ fn as_policy_invalid(error: Error) -> Error {
         Error::Io { .. } | Error::UnsupportedPlatform(_) => error,
         Error::PolicyMissing(_) | Error::PolicyInvalid(_) => error,
         other => Error::PolicyInvalid(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use tempfile::tempdir;
+
+    use super::{APPROVAL_MAX_BYTES, Error, TrustedRoot, verify_existing_bundle_file};
+
+    /// Existing bundle bytes are checked at the artifact cap and never
+    /// replaced while deciding whether a retry is idempotent.
+    ///
+    /// Normative source: SPEC §5.1, §5.5, and §14.1–§14.2.
+    #[test]
+    fn longer_and_oversized_existing_bundle_residue_conflict_without_publication() {
+        for residue in [
+            b"approved-longer".to_vec(),
+            vec![b'x'; APPROVAL_MAX_BYTES + 1],
+        ] {
+            let directory = tempdir().unwrap();
+            let path = Path::new("approval.json");
+            fs::write(directory.path().join(path), &residue).unwrap();
+            let root = TrustedRoot::open(directory.path()).unwrap();
+
+            let error = verify_existing_bundle_file(
+                &root,
+                path,
+                "approval.json",
+                b"approved",
+                APPROVAL_MAX_BYTES,
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::AuthorityConflict(_)));
+            assert_eq!(fs::read(directory.path().join(path)).unwrap(), residue);
+        }
     }
 }
