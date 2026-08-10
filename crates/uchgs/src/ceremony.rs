@@ -1000,6 +1000,33 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_rejects_an_approval_bound_to_another_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = root(&temp.path().join("repository"));
+        let approver = SigningKey::from_bytes(&[83; 32]);
+        let enrolled = credential(&SigningKey::from_bytes(&[84; 32]));
+        let first = stage_enrollment(
+            &repository,
+            &approver,
+            &enrolled,
+            RegistryName::Repository,
+            "first",
+        );
+        let second = stage_enrollment(
+            &repository,
+            &approver,
+            &enrolled,
+            RegistryName::Repository,
+            "second",
+        );
+
+        assert!(matches!(
+            Enrollment::from_authority(&first, &approval(&second, &approver), &enrolled),
+            Err(Error::UnauthorizedApproval(_))
+        ));
+    }
+
+    #[test]
     fn duplicate_physical_registry_root_acquires_one_lock() {
         let temp = tempfile::tempdir().unwrap();
         let shared_path = temp.path().join("shared");

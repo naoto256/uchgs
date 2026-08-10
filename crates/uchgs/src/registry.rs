@@ -125,6 +125,13 @@ impl Enrollment {
         approval: &ApprovalDocument,
         credential: &PublicCredentialDocument,
     ) -> Result<Self> {
+        if approval.approval().request_id != *request.id()
+            || approval.approval().request_sha256 != request.sha256()
+        {
+            return Err(Error::UnauthorizedApproval(
+                "approval does not bind the exact enrollment request".to_owned(),
+            ));
+        }
         let Action::SignerEnroll(action) = &request.request().action else {
             return Err(Error::field(
                 "enrollment",

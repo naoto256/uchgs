@@ -280,9 +280,6 @@ impl TrustedRoot {
                 std::io::Error::other(error.to_string()),
             )
         })?;
-        let identity = file
-            .try_clone()
-            .map_err(|error| Error::io("retain private-file identity", error))?;
         let before = private_file_snapshot(&file)?;
         if before.len > maximum as u64 {
             return Err(Error::EncodedLengthExceeded {
@@ -307,14 +304,13 @@ impl TrustedRoot {
             });
         }
         let after = private_file_snapshot(&file)?;
-        let same_identity = private_file_identity_matches(&identity, &file)?;
         uchgs_custody_platform::verify_private_file(&file).map_err(|error| {
             Error::io(
                 "reverify private operator file",
                 std::io::Error::other(error.to_string()),
             )
         })?;
-        if !same_identity || before != after || after.len != bytes.len() as u64 {
+        if before != after || after.len != bytes.len() as u64 {
             return Err(Error::AuthorityConflict(
                 "private operator file changed while being read".to_owned(),
             ));
@@ -1241,31 +1237,6 @@ fn private_file_snapshot(file: &std::fs::File) -> Result<PrivateFileSnapshot> {
     })
 }
 
-#[cfg(unix)]
-fn private_file_identity_matches(
-    expected: &std::fs::File,
-    observed: &std::fs::File,
-) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let expected = expected
-        .metadata()
-        .map_err(|error| Error::io("stat retained private-file identity", error))?;
-    let observed = observed
-        .metadata()
-        .map_err(|error| Error::io("restat private-file identity", error))?;
-    Ok(expected.dev() == observed.dev() && expected.ino() == observed.ino())
-}
-
-#[cfg(windows)]
-fn private_file_identity_matches(
-    expected: &std::fs::File,
-    observed: &std::fs::File,
-) -> Result<bool> {
-    uchgs_windows_fs::same_file_identity(expected, observed)
-        .map_err(|error| Error::io("compare private-file identity", error))
-}
-
 fn split_file_path(path: &Path) -> Result<(PathBuf, OsString)> {
     validate_relative(path, false)?;
     let name = path
@@ -1585,6 +1556,7 @@ mod tests {
     #[test]
     fn private_staging_creation_mode_is_independent_of_umask() {
         const CHILD: &str = "UCHGS_PRIVATE_STAGING_UMASK_CHILD";
+        const SENTINEL: &str = "UCHGS_PRIVATE_STAGING_UMASK_CHILD_RAN";
         const TEST: &str =
             "authority_file::tests::private_staging_creation_mode_is_independent_of_umask";
 
@@ -1598,12 +1570,13 @@ mod tests {
                 TrustedRoot::create_private_staged_file(&parent, Path::new("private.tmp")).unwrap();
             let metadata = staged.try_clone().unwrap().into_std().metadata().unwrap();
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            println!("{SENTINEL}");
             return;
         }
 
         let test_binary = std::env::current_exe().unwrap();
         for mask in ["000", "022", "077"] {
-            let status = std::process::Command::new("/bin/sh")
+            let output = std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg("umask \"$1\"; shift; exec \"$@\"")
                 .arg("sh")
@@ -1613,12 +1586,16 @@ mod tests {
                 .arg(TEST)
                 .arg("--nocapture")
                 .env(CHILD, "1")
-                .status()
+                .output()
                 .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
-                status.success(),
-                "private staging failed under umask {mask}"
+                output.status.success(),
+                "private staging failed under umask {mask}: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
+            assert!(stdout.contains("running 1 test"));
+            assert_eq!(stdout.matches(SENTINEL).count(), 1);
         }
     }
 
