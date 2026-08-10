@@ -44,9 +44,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Compile all tests
-        # Golden-vector tests are deliberately red until the extractor exists.
-        run: cargo test --workspace --all-targets --locked --no-run
+      - name: Run tests
+        run: cargo test --workspace --all-targets --locked
       - name: Check acceptance inventory
         run: cargo test -p uchgs --test acceptance_skeleton --locked
 

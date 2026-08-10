@@ -1,7 +1,23 @@
-//! Ignored acceptance-test skeletons enumerating every item in SPEC §16.
+//! Acceptance tests enumerating every item in SPEC §16.
 //!
-//! Each skeleton records the normative SPEC section(s) that later phases must
-//! implement. This scaffold contains no product behavior.
+//! Extractor-only items are executable; later-phase items remain ignored
+//! skeletons. Every item records its normative SPEC section(s).
+
+use uchgs::extract::{JudgmentUnit, ObjectFormat, UnitKind, extract_git_object};
+
+/// Builds exact Git object framing for extractor-only SPEC §3.3 acceptance tests.
+fn frame(kind: &str, body: &[u8]) -> Vec<u8> {
+    let mut object = format!("{kind} {}\0", body.len()).into_bytes();
+    object.extend_from_slice(body);
+    object
+}
+
+/// Extracts the sole unit expected from a valid commit/tag/blob object.
+fn extract_one(format: ObjectFormat, kind: &str, body: &[u8]) -> JudgmentUnit {
+    let units = extract_git_object(format, &frame(kind, body)).expect("valid SPEC §3 object");
+    assert_eq!(units.len(), 1, "object must yield one unit");
+    units.into_iter().next().expect("one unit")
+}
 
 macro_rules! acceptance_skeleton {
     ($name:ident, $item:literal, $sections:literal) => {
@@ -80,86 +96,251 @@ acceptance_skeleton!(
 );
 
 // SPEC §16「判定対象の抜き出し」; normative rules: SPEC §2–§3, §10–§11, Appendix A.
-acceptance_skeleton!(
-    extract_01_rejects_malformed_git_objects,
-    "未知の型・壊れた長さ・重複必須ヘッダ・順序違いtree entryを拒否する",
-    "SPEC §3.3"
-);
-acceptance_skeleton!(
-    extract_02_omits_git_plumbing_fields,
-    "treeのmode/object ID/枠組みとcommitの親/tree/時刻/枠組みを判定対象にしない",
-    "SPEC §3.0–§3.1, §3.3"
-);
-acceptance_skeleton!(
-    extract_03_supports_sha1_and_sha256_object_formats,
-    "sha1とsha256の両object formatで成立する",
-    "SPEC §2.2, §3.3"
-);
-acceptance_skeleton!(
-    extract_04_has_exactly_five_unit_kinds,
-    "種類はfile/path/commit/tag/refの5つだけ",
-    "SPEC §2.2, §3"
-);
+/// SPEC §16「未知型・壊れた長さ・重複必須ヘッダ・tree順序違反」; SPEC §3.3.
+#[test]
+fn extract_01_rejects_malformed_git_objects() {
+    assert!(extract_git_object(ObjectFormat::Sha1, b"note 0\0").is_err());
+    assert!(extract_git_object(ObjectFormat::Sha1, b"blob 01\0x").is_err());
+    assert!(extract_git_object(ObjectFormat::Sha1, b"blob 2\0x").is_err());
+
+    let duplicate_tree = b"tree 0000000000000000000000000000000000000000\n\
+tree 1111111111111111111111111111111111111111\n\
+author A <a@x> 1 +0000\n\
+committer A <a@x> 1 +0000\n\
+\n\
+message\n";
+    assert!(extract_git_object(ObjectFormat::Sha1, &frame("commit", duplicate_tree)).is_err());
+
+    let oid = [1_u8; 20];
+    let mut reversed_tree = b"100644 z\0".to_vec();
+    reversed_tree.extend_from_slice(&oid);
+    reversed_tree.extend_from_slice(b"100644 a\0");
+    reversed_tree.extend_from_slice(&oid);
+    assert!(extract_git_object(ObjectFormat::Sha1, &frame("tree", &reversed_tree)).is_err());
+
+    let mut dotdot_tree = b"100644 ..\0".to_vec();
+    dotdot_tree.extend_from_slice(&oid);
+    assert!(extract_git_object(ObjectFormat::Sha1, &frame("tree", &dotdot_tree)).is_err());
+}
+
+/// SPEC §16「Git配管を判定対象にしない」; SPEC §3.0–§3.1, §3.3.
+#[test]
+fn extract_02_omits_git_plumbing_fields() {
+    let before = b"tree 0000000000000000000000000000000000000000\n\
+parent 1111111111111111111111111111111111111111\n\
+author A <a@x> 1 +0000\n\
+committer C <c@x> 2 -0500\n\
+\n\
+message\n";
+    let after = b"tree ffffffffffffffffffffffffffffffffffffffff\n\
+parent eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n\
+author A <a@x> 300 +0900\n\
+committer C <c@x> 400 +0000\n\
+\n\
+message\n";
+    let before = extract_one(ObjectFormat::Sha1, "commit", before);
+    let after = extract_one(ObjectFormat::Sha1, "commit", after);
+    assert_eq!(before.bytes(), after.bytes());
+    assert_eq!(before.id(), after.id());
+}
+
+/// SPEC §16「sha1/sha256 object format」; SPEC §2.2, §3.3.
+#[test]
+fn extract_03_supports_sha1_and_sha256_object_formats() {
+    for (format, oid_length) in [(ObjectFormat::Sha1, 20), (ObjectFormat::Sha256, 32)] {
+        let mut tree = b"100644 file\0".to_vec();
+        tree.extend(std::iter::repeat_n(1, oid_length));
+        assert!(extract_git_object(format, &frame("tree", &tree)).is_ok());
+    }
+
+    let sha1 = b"tree 0000000000000000000000000000000000000000\n\
+author A <a@x> 1 +0000\n\
+committer A <a@x> 1 +0000\n\
+\n\
+message\n";
+    let sha256 = b"tree 0000000000000000000000000000000000000000000000000000000000000000\n\
+author A <a@x> 1 +0000\n\
+committer A <a@x> 1 +0000\n\
+\n\
+message\n";
+    assert_eq!(
+        extract_one(ObjectFormat::Sha1, "commit", sha1).bytes(),
+        extract_one(ObjectFormat::Sha256, "commit", sha256).bytes(),
+    );
+}
+
+/// SPEC §16「unit kindは閉じた5種」; SPEC §2.2, §3.
+#[test]
+fn extract_04_has_exactly_five_unit_kinds() {
+    assert_eq!(
+        [
+            UnitKind::File,
+            UnitKind::Path,
+            UnitKind::Commit,
+            UnitKind::Tag,
+            UnitKind::Ref,
+        ]
+        .map(UnitKind::as_str),
+        ["file", "path", "commit", "tag", "ref"],
+    );
+    assert!("tree".parse::<UnitKind>().is_err());
+}
 acceptance_skeleton!(
     extract_05_reproduces_all_appendix_a_vectors,
     "付録Aの全golden vectorの長さとSHA-256を再現する",
     "SPEC Appendix A, §3"
 );
-acceptance_skeleton!(
-    extract_06_commit_omits_parent_time_and_framing,
-    "commit抜き出しから親・時刻・枠組みを落とす",
-    "SPEC §3.1, Appendix A.1"
-);
-acceptance_skeleton!(
-    extract_07_commit_omits_all_extra_headers,
-    "gpgsigやencoding等の追加ヘッダをcommit抜き出しに含めない",
-    "SPEC §3.1, Appendix A.2"
-);
+/// SPEC §16「commitは親・時刻・枠組みを落とす」; SPEC §3.1, Appendix A.1.
+#[test]
+fn extract_06_commit_omits_parent_time_and_framing() {
+    let body = b"tree 0000000000000000000000000000000000000000\n\
+parent 1111111111111111111111111111111111111111\n\
+author A <a@x> -1 +0900\n\
+committer C <c@x> 2 -0500\n\
+\n\
+message\n";
+    let unit = extract_one(ObjectFormat::Sha1, "commit", body);
+    assert_eq!(
+        unit.bytes(),
+        b"author A <a@x>\ncommitter C <c@x>\n\nmessage\n"
+    );
+}
+
+/// SPEC §16「commit追加ヘッダを全部落とす」; SPEC §3.1, Appendix A.2.
+#[test]
+fn extract_07_commit_omits_all_extra_headers() {
+    let plain = b"tree 0000000000000000000000000000000000000000\n\
+author A <a@x> 1 +0000\n\
+committer C <c@x> 2 +0000\n\
+\n\
+message\n";
+    let extended = b"tree 0000000000000000000000000000000000000000\n\
+author A <a@x> 1 +0000\n\
+committer C <c@x> 2 +0000\n\
+encoding ISO-8859-1\n\
+gpgsig signature\n\
+\x20continuation\n\
+\n\
+message\n";
+    assert_eq!(
+        extract_one(ObjectFormat::Sha1, "commit", plain).id(),
+        extract_one(ObjectFormat::Sha1, "commit", extended).id(),
+    );
+}
 acceptance_skeleton!(
     extract_08_signed_commit_rebase_preserves_key,
     "署名付きcommitをrebaseしてもcommitの鍵が変わらない",
     "SPEC §3.1, Appendix A.2, Appendix A.7"
 );
-acceptance_skeleton!(
-    extract_09_adding_signature_preserves_key,
-    "未署名commitに後から署名を足してもcommitの鍵が変わらない",
-    "SPEC §3.1, Appendix A.2"
-);
-acceptance_skeleton!(
-    extract_10_mergetag_yields_only_commit_unit,
-    "mergetag付きmerge commitからcommit判定対象だけを1つ出す",
-    "SPEC §3.1, Appendix A.3b"
-);
+/// SPEC §16「後付け署名でcommit鍵不変」; SPEC §3.1, Appendix A.2.
+#[test]
+fn extract_09_adding_signature_preserves_key() {
+    let plain = b"tree 0000000000000000000000000000000000000000\n\
+author A <a@x> 1 +0000\n\
+committer C <c@x> 2 +0000\n\
+\n\
+signed later\n";
+    let signed = b"tree 0000000000000000000000000000000000000000\n\
+author A <a@x> 1 +0000\n\
+committer C <c@x> 2 +0000\n\
+gpgsig signature\n\
+\x20continued\n\
+\n\
+signed later\n";
+    assert_eq!(
+        extract_one(ObjectFormat::Sha1, "commit", plain).id(),
+        extract_one(ObjectFormat::Sha1, "commit", signed).id(),
+    );
+}
+
+/// SPEC §16「mergetagはcommit unit 1つだけ」; SPEC §3.1, Appendix A.3b.
+#[test]
+fn extract_10_mergetag_yields_only_commit_unit() {
+    let body = b"tree 0000000000000000000000000000000000000000\n\
+parent 1111111111111111111111111111111111111111\n\
+author A <a@x> 1 +0000\n\
+committer C <c@x> 2 +0000\n\
+mergetag object 1111111111111111111111111111111111111111\n\
+\x20type commit\n\
+\x20tag v1\n\
+\x20tagger T <t@x> 3 +0000\n\
+\x20\n\
+\x20tag message\n\
+\n\
+merge message\n";
+    let units = extract_git_object(ObjectFormat::Sha1, &frame("commit", body))
+        .expect("valid mergetag commit");
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].kind(), UnitKind::Commit);
+    assert_eq!(
+        units[0].bytes(),
+        b"author A <a@x>\ncommitter C <c@x>\n\nmerge message\n"
+    );
+}
 acceptance_skeleton!(
     extract_11_rewrite_operations_preserve_commit_key,
     "rebase・cherry-pick・amendの前後でcommitの鍵が変わらない",
     "SPEC §3.1, Appendix A.7"
 );
-acceptance_skeleton!(
-    extract_12_duplicate_file_content_deduplicates_file_not_path,
-    "同内容が2箇所ならfileは1つでpathは2つになる",
-    "SPEC §3.3 step 4"
-);
-acceptance_skeleton!(
-    extract_13_rename_changes_only_path,
-    "内容を変えず移動するとpathだけが新しくなる",
-    "SPEC §3.3 step 3"
-);
+/// SPEC §16「同内容2箇所はfile 1つ/path 2つ」; SPEC §3 and §4.
+#[test]
+fn extract_12_duplicate_file_content_deduplicates_file_not_path() {
+    let first_file = JudgmentUnit::file(b"same contents".to_vec());
+    let second_file = JudgmentUnit::file(b"same contents".to_vec());
+    let first_path = JudgmentUnit::path(b"first/name".to_vec()).expect("valid first path");
+    let second_path = JudgmentUnit::path(b"second/name".to_vec()).expect("valid second path");
+
+    assert_eq!(first_file.id(), second_file.id());
+    assert_ne!(first_path.id(), second_path.id());
+}
+
+/// SPEC §16「内容不変の移動はpathだけが新しい」; SPEC §3 and §4.
+#[test]
+fn extract_13_rename_changes_only_path() {
+    let before_file = JudgmentUnit::file(b"unchanged".to_vec());
+    let after_file = JudgmentUnit::file(b"unchanged".to_vec());
+    let before_path = JudgmentUnit::path(b"old/name".to_vec()).expect("valid old path");
+    let after_path = JudgmentUnit::path(b"new/name".to_vec()).expect("valid new path");
+
+    assert_eq!(before_file.id(), after_file.id());
+    assert_ne!(before_path.id(), after_path.id());
+}
 acceptance_skeleton!(
     extract_14_submodule_and_symlink_semantics,
     "submoduleはpathのみでsymlinkはリンク先文字列がfileになる",
     "SPEC §3.0, §3.3"
 );
-acceptance_skeleton!(
-    extract_15_rejects_invalid_git_timestamps,
-    "Git文法外の時刻・タイムゾーンを持つobjectを拒否する",
-    "SPEC §3.1–§3.2, §3.3"
-);
-acceptance_skeleton!(
-    extract_16_non_utf8_identity_reproduces_appendix_a8_key,
-    "UTF-8でないidentity bytesを持つcommitが付録A.8の鍵を再現する",
-    "SPEC §3.1, Appendix A.8"
-);
+/// SPEC §16「Git文法外の時刻・timezoneを拒否」; SPEC §3.1–§3.3.
+#[test]
+fn extract_15_rejects_invalid_git_timestamps() {
+    for identity in [
+        "A <a@x> 01 +0000",
+        "A <a@x> 1 0000",
+        "A <a@x> 1 +000",
+        "A <a@x> x +0000",
+    ] {
+        let body = format!(
+            "tree 0000000000000000000000000000000000000000\nauthor {identity}\ncommitter A <a@x> 1 +0000\n\nmessage\n"
+        );
+        assert!(extract_git_object(ObjectFormat::Sha1, &frame("commit", body.as_bytes())).is_err());
+    }
+}
+
+/// SPEC §16「non-UTF-8 identityはA.8の鍵を再現」; SPEC §3.1, Appendix A.8.
+#[test]
+fn extract_16_non_utf8_identity_reproduces_appendix_a8_key() {
+    let body = b"tree da462c9f8a2be3504f3f50d77c36a6066b02d876\n\
+author Ren\xe9 Dubois <rene@example.com> 1700000000 +0900\n\
+committer Ren\xe9 Dubois <rene@example.com> 1700000123 -0500\n\
+\n\
+fix encoding\n";
+    let unit = extract_one(ObjectFormat::Sha1, "commit", body);
+    assert_eq!(unit.bytes().len(), 93);
+    assert_eq!(
+        unit.digest().to_string(),
+        "3bdc2f5072b618cede691d92d8a955438b0f61c494fba34277e2e6f879d4585e"
+    );
+}
 acceptance_skeleton!(
     extract_17_commit_gate_accepts_non_utf8_author_identity,
     "git var GIT_AUTHOR_IDENTの出力がUTF-8でなくてもcommit gateが動く",
@@ -167,11 +348,14 @@ acceptance_skeleton!(
 );
 
 // SPEC §16「鍵」; normative rules: SPEC §2.2, §3, §6.3.
-acceptance_skeleton!(
-    key_01_kind_separates_identical_bytes,
-    "同じバイト列でも種類が違えば別の鍵になる",
-    "SPEC §2.2, §3"
-);
+/// SPEC §16「同じbytesでも種類が違えば別鍵」; SPEC §2.2, §3–§4.
+#[test]
+fn key_01_kind_separates_identical_bytes() {
+    let file = JudgmentUnit::file(b"same".to_vec());
+    let path = JudgmentUnit::path(b"same".to_vec()).expect("valid path");
+    assert_eq!(file.digest(), path.digest());
+    assert_ne!(file.id(), path.id());
+}
 acceptance_skeleton!(
     key_02_git_object_id_does_not_satisfy_judgment,
     "Git object IDは判定を満たさない",

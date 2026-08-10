@@ -1,32 +1,35 @@
-//! Red-first golden-vector tests transcribed from SPEC Appendix A.
-//!
-//! The test-local API is intentionally temporary. The extractor remains
-//! deliberately unimplemented until SPEC §3 is implemented.
-//!
-//! Unlike the SPEC §16 skeletons these tests carry no `#[ignore]`, so the suite
-//! fails until the extractor exists. That failing state is the signal itself;
-//! silencing it with `#[ignore]` would drop the requirement without recording
-//! the decision.
+//! Golden-vector tests transcribed from SPEC Appendix A.
 
-#[derive(Clone, Copy)]
-enum UnitKind {
-    File,
-    Path,
-    Commit,
-    Tag,
-    Ref,
+use uchgs::extract::{JudgmentUnit, ObjectFormat, UnitKind, extract_git_object};
+
+/// Wraps an unchanged Appendix A object body in the exact SPEC §3.3 frame.
+fn frame(kind: &str, body: &[u8]) -> Vec<u8> {
+    let mut object = format!("{kind} {}\0", body.len()).into_bytes();
+    object.extend_from_slice(body);
+    object
 }
 
-struct ExtractedUnit {
-    bytes: Vec<u8>,
-    sha256: String,
+/// Applies the SPEC §3 extractor or exact path/ref unit validation.
+fn extract_and_hash(kind: UnitKind, input: &[u8]) -> JudgmentUnit {
+    match kind {
+        UnitKind::File | UnitKind::Commit | UnitKind::Tag => {
+            let object_kind = match kind {
+                UnitKind::File => "blob",
+                UnitKind::Commit => "commit",
+                UnitKind::Tag => "tag",
+                UnitKind::Path | UnitKind::Ref => unreachable!("matched above"),
+            };
+            let units = extract_git_object(ObjectFormat::Sha1, &frame(object_kind, input))
+                .expect("SPEC Appendix A object must validate");
+            assert_eq!(units.len(), 1, "SPEC Appendix A object unit count");
+            units.into_iter().next().expect("one extracted unit")
+        }
+        UnitKind::Path => JudgmentUnit::path(input.to_vec()).expect("SPEC Appendix A path"),
+        UnitKind::Ref => JudgmentUnit::ref_name(input.to_vec()).expect("SPEC Appendix A ref"),
+    }
 }
 
-/// Provisional red stub for the extraction and unit digest rules in SPEC §2.2 and §3.
-fn extract_and_hash(_kind: UnitKind, _input: &[u8]) -> ExtractedUnit {
-    todo!("SPEC §3 extraction is implemented in a later phase")
-}
-
+/// Compares one extracted unit with its SPEC Appendix A exact bytes and digest.
 fn assert_golden(
     kind: UnitKind,
     input: &[u8],
@@ -34,18 +37,16 @@ fn assert_golden(
     expected_length: usize,
     expected_sha256: &str,
 ) {
-    // Validate the transcription before reaching the stub below: this assertion
-    // still runs while extraction is unimplemented, so a mis-copied Appendix A
-    // vector fails on its own terms instead of being masked by the `todo!()`.
     assert_eq!(
         expected_bytes.len(),
         expected_length,
         "SPEC Appendix A expected-byte length",
     );
     let actual = extract_and_hash(kind, input);
-    assert_eq!(actual.bytes, expected_bytes);
-    assert_eq!(actual.bytes.len(), expected_length);
-    assert_eq!(actual.sha256, expected_sha256);
+    assert_eq!(actual.bytes(), expected_bytes);
+    assert_eq!(actual.bytes().len(), expected_length);
+    assert_eq!(actual.digest().to_string(), expected_sha256);
+    assert_eq!(actual.kind(), kind);
 }
 
 /// SPEC Appendix A.1; extraction rule: SPEC §3.1.
@@ -65,7 +66,7 @@ fix typo\n\
 \n\
 body line\n";
 
-    assert_eq!(INPUT.len(), 184, "SPEC Appendix A.7 records A.1 raw length");
+    assert_eq!(INPUT.len(), 184, "SPEC Appendix A.1 raw input length");
 
     assert_golden(
         UnitKind::Commit,
@@ -84,9 +85,9 @@ parent 5e0c637988f3fcf856ea6cd33a0697f92389031f\n\
 author Alice  Smith <alice@example.com> 1700000300 +0900\n\
 committer Alice  Smith <alice@example.com> 1700000400 +0000\n\
 gpgsig -----BEGIN PGP SIGNATURE-----\n\
- \n\
- iQEzBAABCgAd\n\
- -----END PGP SIGNATURE-----\n\
+\x20\n\
+\x20iQEzBAABCgAd\n\
+\x20-----END PGP SIGNATURE-----\n\
 \n\
 signed commit\n";
     const EXPECTED: &[u8] = b"author Alice  Smith <alice@example.com>\n\
@@ -135,11 +136,11 @@ parent 158729fe5df289a2706f178b015605ddf882f836\n\
 author Alice  Smith <alice@example.com> 1700000500 +0900\n\
 committer Alice  Smith <alice@example.com> 1700000600 +0000\n\
 mergetag object 5e0c637988f3fcf856ea6cd33a0697f92389031f\n\
- type commit\n\
- tag v1.0\n\
- tagger Alice  Smith <alice@example.com> 1700000200 +0000\n\
- \n\
- release one\n\
+\x20type commit\n\
+\x20tag v1.0\n\
+\x20tagger Alice  Smith <alice@example.com> 1700000200 +0000\n\
+\x20\n\
+\x20release one\n\
 \n\
 Merge tag 'v1.0'\n";
     const EXPECTED: &[u8] = b"author Alice  Smith <alice@example.com>\n\
