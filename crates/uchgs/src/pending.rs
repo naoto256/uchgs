@@ -86,6 +86,19 @@ impl<'a> PendingStore<'a> {
         })
     }
 
+    /// Loads the exact request bytes retained by the pending transport.
+    ///
+    /// Policy activation uses this crate-private seam to resume the same
+    /// approved operation without duplicating the §7.5 path grammar.
+    ///
+    /// Normative source: SPEC §5.5 and §7.5–§7.6.
+    pub(crate) fn load_retained_request(&self, request_id: &RequestId) -> Result<RequestDocument> {
+        if self.exists(&approved_request_path(request_id))? {
+            return Ok(self.load_approved_pair(request_id)?.0);
+        }
+        self.load_pending_request(request_id)
+    }
+
     /// Publishes one signed approval candidate under a non-final name.
     ///
     /// Normative source: SPEC §7.5 step 3.

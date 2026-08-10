@@ -17,6 +17,8 @@ pub enum Error {
     AuthorityConflict(String),
     AuthorityNotFound(String),
     UnauthorizedApproval(String),
+    PolicyMissing(String),
+    PolicyInvalid(String),
     UnsupportedPlatform(String),
     Io {
         operation: &'static str,
@@ -64,6 +66,8 @@ impl fmt::Display for Error {
             Self::UnauthorizedApproval(reason) => {
                 write!(formatter, "unauthorized approval: {reason}")
             }
+            Self::PolicyMissing(reason) => write!(formatter, "policy missing: {reason}"),
+            Self::PolicyInvalid(reason) => write!(formatter, "policy invalid: {reason}"),
             Self::UnsupportedPlatform(reason) => {
                 write!(formatter, "unsupported platform: {reason}")
             }
