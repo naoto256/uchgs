@@ -4,6 +4,7 @@
 
 use std::{fmt, str::FromStr};
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest as _, Sha256};
 
 use crate::{Error, Result, wire::Digest32};
@@ -140,6 +141,26 @@ impl FromStr for UnitId {
             .split_once('/')
             .ok_or_else(|| Error::field("unit id", "missing kind separator"))?;
         Ok(Self::from_parts(kind.parse()?, digest.parse()?))
+    }
+}
+
+impl Serialize for UnitId {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for UnitId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
     }
 }
 

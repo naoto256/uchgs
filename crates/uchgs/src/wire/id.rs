@@ -69,7 +69,7 @@ impl<'de> Deserialize<'de> for Digest32 {
 
 macro_rules! versioned_id {
     ($name:ident, $prefix:literal) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(try_from = "String", into = "String")]
         pub struct $name(String);
 
@@ -136,6 +136,10 @@ macro_rules! versioned_id {
 }
 
 versioned_id!(CredentialId, "credential/v1/sha256/");
+versioned_id!(RequestId, "request/v1/sha256/");
+versioned_id!(PolicyId, "policy/v1/sha256/");
+versioned_id!(PushIntentId, "push-intent/v1/sha256/");
+versioned_id!(GenesisId, "genesis/v1/sha256/");
 
 pub(crate) fn decode_lower_hex_exact(
     value: &str,

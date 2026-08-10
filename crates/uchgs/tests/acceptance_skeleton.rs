@@ -361,38 +361,9 @@ acceptance_skeleton!(
     "Git object IDは判定を満たさない",
     "SPEC §2.2, §3"
 );
-acceptance_skeleton!(
-    key_03_state_key_uses_canonical_tree_bytes,
-    "状態判定の鍵はtree正準バイト列のSHA-256でtree OIDは観測位置だけ",
-    "SPEC §3.0, §6.3"
-);
+// key_03 は authority_acceptance.rs で解禁済み。
 
-// SPEC §16「承認の自己完結」; normative rules: SPEC §7.3–§7.4, §8, §9.3.
-acceptance_skeleton!(
-    self_contained_01_delegation_embeds_grant_chain_and_credential,
-    "委任承認のdelegationにgrant request・人間のapproval・公開鍵を同梱する",
-    "SPEC §7.3, §9.3"
-);
-acceptance_skeleton!(
-    self_contained_02_verifies_after_daemon_exit,
-    "daemon終了後も承認バイト列と登録簿だけで検証できる",
-    "SPEC §7.3–§7.4, §9.3"
-);
-acceptance_skeleton!(
-    self_contained_03_has_no_persistent_grants_store,
-    "権限材料をディスクに保管するgrantsディレクトリが存在しない",
-    "SPEC §9.1–§9.5"
-);
-acceptance_skeleton!(
-    self_contained_04_rejects_unregistered_grant_signer,
-    "grant_approval署名者が登録簿に無ければ拒否する",
-    "SPEC §7.4, §8, §9.3"
-);
-acceptance_skeleton!(
-    self_contained_05_direct_approval_has_null_delegation,
-    "直接承認ではdelegationがnullになる",
-    "SPEC §7.3"
-);
+// SPEC §16「承認の自己完結」は authority_acceptance.rs で解禁済み。
 
 // SPEC §16「commit gate」; normative rules: SPEC §10.
 acceptance_skeleton!(
@@ -483,42 +454,7 @@ acceptance_skeleton!(
     "SPEC §5.3, §11.4"
 );
 
-// SPEC §16「承認」; normative rules: SPEC §7.
-acceptance_skeleton!(
-    approval_01_caller_cannot_supply_nonce_or_time,
-    "nonceと時刻を呼び出し側から与えられない",
-    "SPEC §7.1, §7.3, §12.3"
-);
-acceptance_skeleton!(
-    approval_02_repeated_content_gets_distinct_request_ids,
-    "同内容の再実行でも別request IDになる",
-    "SPEC §7.1"
-);
-acceptance_skeleton!(
-    approval_03_expired_digest_cannot_be_recreated,
-    "時効requestと同digestのrequestを二度と作れない",
-    "SPEC §7.5"
-);
-acceptance_skeleton!(
-    approval_04_verifies_exact_persisted_request_bytes,
-    "承認を保存requestのexact bytesに対して検証する",
-    "SPEC §7.4"
-);
-acceptance_skeleton!(
-    approval_05_one_scope_request_contains_whole_required_set,
-    "1観点の要求集合を1requestにまとめる",
-    "SPEC §7.1, §10.1, §11.3"
-);
-acceptance_skeleton!(
-    approval_06_finalized_pair_moves_to_approvals,
-    "判定確定後にrequestとapprovalの対をapprovalsへ移す",
-    "SPEC §7.6"
-);
-acceptance_skeleton!(
-    approval_07_crashed_move_is_reconciled_by_next_gate,
-    "移動中crash後に次gateで対を最終化する",
-    "SPEC §7.6"
-);
+// SPEC §16「承認」7項目は authority_acceptance.rs で解禁済み。
 
 // SPEC §16「設定」; normative rules: SPEC §5.
 acceptance_skeleton!(
@@ -553,21 +489,7 @@ acceptance_skeleton!(
     "未登録鍵による登録を拒否する",
     "SPEC §8.3"
 );
-acceptance_skeleton!(
-    registry_03_documents_match_closed_schema,
-    "credential・genesis・enrollmentが§8.4の欄と完全一致する",
-    "SPEC §8.4"
-);
-acceptance_skeleton!(
-    registry_04_recomputes_all_document_ids_on_load,
-    "credential ID・genesis ID・enrollment_idを読込ごとに再計算する",
-    "SPEC §8.4"
-);
-acceptance_skeleton!(
-    registry_05_signature_material_matches_credential_type,
-    "signature materialとcredential typeの組合せ違いを拒否する",
-    "SPEC §7.4, §8.4"
-);
+// registry_03–05 は authority_acceptance.rs で解禁済み。
 acceptance_skeleton!(
     registry_06_plaintext_private_keys_are_unsupported,
     "平文秘密鍵を生成せず受け付けない",
