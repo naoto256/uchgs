@@ -289,6 +289,15 @@ fn open_relative(
     name: &OsStr,
     kind: RelativeOpenKind,
 ) -> io::Result<OpenedObject> {
+    open_relative_with_security_descriptor(parent, name, kind, ptr::null())
+}
+
+fn open_relative_with_security_descriptor(
+    parent: &std::fs::File,
+    name: &OsStr,
+    kind: RelativeOpenKind,
+    security_descriptor: *const std::ffi::c_void,
+) -> io::Result<OpenedObject> {
     let mut name = direct_child_utf16(name)?;
     require_local_ntfs(parent)?;
     let spec = kind.spec();
@@ -309,7 +318,7 @@ fn open_relative(
         RootDirectory: parent.as_raw_handle() as HANDLE,
         ObjectName: &unicode,
         Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: ptr::null(),
+        SecurityDescriptor: security_descriptor.cast(),
         SecurityQualityOfService: ptr::null(),
     };
     let mut status = IO_STATUS_BLOCK::default();
@@ -355,6 +364,31 @@ fn open_relative(
 
 pub fn create_regular(parent: &std::fs::File, name: &OsStr) -> io::Result<OpenedObject> {
     open_relative(parent, name, RelativeOpenKind::NewRegular)
+}
+
+/// Creates a regular file with the caller's already-built security descriptor
+/// applied atomically by `NtCreateFile`.
+///
+/// # Safety
+/// `security_descriptor` must point to a valid Windows security descriptor for
+/// the duration of this synchronous call.
+pub unsafe fn create_regular_with_security_descriptor(
+    parent: &std::fs::File,
+    name: &OsStr,
+    security_descriptor: *const std::ffi::c_void,
+) -> io::Result<OpenedObject> {
+    if security_descriptor.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "security descriptor must not be null",
+        ));
+    }
+    open_relative_with_security_descriptor(
+        parent,
+        name,
+        RelativeOpenKind::NewRegular,
+        security_descriptor,
+    )
 }
 
 pub fn open_regular(parent: &std::fs::File, name: &OsStr) -> io::Result<OpenedObject> {

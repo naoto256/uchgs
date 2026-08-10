@@ -79,6 +79,31 @@ pub struct TrustedRoot {
     dir: Dir,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrivateFileSnapshot {
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(windows)]
+    attributes: u32,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
+}
+
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowsAuthorityCapability {
@@ -125,9 +150,176 @@ impl TrustedRoot {
         Ok(Self { dir })
     }
 
+    /// Opens an operator-selected absolute file path as a validated parent
+    /// capability plus one direct-child name.
+    ///
+    /// Normative source: SPEC §14.1–§14.2.
+    pub(crate) fn open_operator_parent(path: &Path) -> Result<(Self, OsString)> {
+        if !path.is_absolute() {
+            return Err(Error::field(
+                "operator_path",
+                "must be an absolute file path",
+            ));
+        }
+        let final_name = path
+            .file_name()
+            .ok_or_else(|| Error::field("operator_path", "must name one file"))?
+            .to_os_string();
+        let mut final_components = Path::new(&final_name).components();
+        if !matches!(final_components.next(), Some(Component::Normal(_)))
+            || final_components.next().is_some()
+        {
+            return Err(Error::field(
+                "operator_path",
+                "final component must be one ordinary name",
+            ));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::field("operator_path", "must have an absolute parent"))?;
+        let root_path = parent
+            .ancestors()
+            .last()
+            .ok_or_else(|| Error::field("operator_path", "must have an absolute root"))?;
+        if !root_path.is_absolute() {
+            return Err(Error::field("operator_path", "must have an absolute root"));
+        }
+        let relative_parent = parent
+            .strip_prefix(root_path)
+            .map_err(|_| Error::field("operator_path", "parent escaped its absolute root"))?;
+        let mut current = Dir::open_ambient_dir(root_path, ambient_authority())
+            .map_err(|error| Error::io("open operator filesystem root", error))?;
+        for component in relative_parent.components() {
+            let Component::Normal(name) = component else {
+                return Err(Error::field(
+                    "operator_path",
+                    "parent contains a namespace escape",
+                ));
+            };
+            current = current
+                .open_dir_nofollow(name)
+                .map_err(|error| Error::io("open operator parent component", error))?;
+        }
+        Ok((Self { dir: current }, final_name))
+    }
+
     /// Reads one bounded ordinary file through the same opened handle.
     pub fn read_file(&self, relative: impl AsRef<Path>, maximum: usize) -> Result<Vec<u8>> {
         self.read_file_with_hook(relative.as_ref(), maximum, || {})
+    }
+
+    /// Reads one protected operator file through its validated parent handle.
+    ///
+    /// Normative source: SPEC §8.6 and §14.1.
+    pub(crate) fn read_private_file(&self, name: &Path, maximum: usize) -> Result<Vec<u8>> {
+        self.read_private_file_with_hook(name, maximum, || {})
+    }
+
+    fn read_private_file_with_hook(
+        &self,
+        name: &Path,
+        maximum: usize,
+        after_initial_stat: impl FnOnce(),
+    ) -> Result<Vec<u8>> {
+        self.require_writable_authority_filesystem()?;
+        Self::read_private_dir_file_with_hook(&self.dir, name, maximum, after_initial_stat)
+    }
+
+    fn read_private_dir_file(dir: &Dir, name: &Path, maximum: usize) -> Result<Vec<u8>> {
+        Self::read_private_dir_file_with_hook(dir, name, maximum, || {})
+    }
+
+    fn read_private_dir_file_with_hook(
+        dir: &Dir,
+        name: &Path,
+        maximum: usize,
+        after_initial_stat: impl FnOnce(),
+    ) -> Result<Vec<u8>> {
+        let (parent, name) = split_file_path(name)?;
+        if !parent.as_os_str().is_empty() {
+            return Err(Error::field(
+                "operator_path",
+                "private file must be a direct child of the opened parent",
+            ));
+        }
+
+        #[cfg(not(windows))]
+        let file = {
+            let mut options = OpenOptions::new();
+            options.read(true);
+            options.follow(FollowSymlinks::No);
+            use cap_std::fs::OpenOptionsExt as _;
+            options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+            dir.open_with(Path::new(&name), &options)
+                .map_err(|error| Error::io("open private operator file", error))?
+                .into_std()
+        };
+        #[cfg(windows)]
+        let file = {
+            let parent = dir
+                .try_clone()
+                .map_err(|error| Error::io("clone private-file parent", error))?
+                .into_std_file();
+            let opened = uchgs_windows_fs::open_regular(&parent, &name)
+                .map_err(|error| Error::io("open private operator file", error))?;
+            opened
+                .try_clone_file()
+                .map_err(|error| Error::io("retain private operator file handle", error))?
+        };
+        Self::read_private_std_file_with_hook(file, maximum, after_initial_stat)
+    }
+
+    fn read_private_std_file_with_hook(
+        mut file: std::fs::File,
+        maximum: usize,
+        after_initial_stat: impl FnOnce(),
+    ) -> Result<Vec<u8>> {
+        uchgs_custody_platform::verify_private_file(&file).map_err(|error| {
+            Error::io(
+                "verify private operator file",
+                std::io::Error::other(error.to_string()),
+            )
+        })?;
+        let identity = file
+            .try_clone()
+            .map_err(|error| Error::io("retain private-file identity", error))?;
+        let before = private_file_snapshot(&file)?;
+        if before.len > maximum as u64 {
+            return Err(Error::EncodedLengthExceeded {
+                maximum,
+                actual: usize::try_from(before.len).unwrap_or(usize::MAX),
+            });
+        }
+        after_initial_stat();
+        let limit = maximum
+            .checked_add(1)
+            .ok_or_else(|| Error::field("operator_path", "maximum is too large"))?;
+        let capacity = usize::try_from(before.len)
+            .map_err(|_| Error::field("operator_path", "file length does not fit in memory"))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        Read::take(&mut file, limit as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| Error::io("read private operator file", error))?;
+        if bytes.len() > maximum {
+            return Err(Error::EncodedLengthExceeded {
+                maximum,
+                actual: bytes.len(),
+            });
+        }
+        let after = private_file_snapshot(&file)?;
+        let same_identity = private_file_identity_matches(&identity, &file)?;
+        uchgs_custody_platform::verify_private_file(&file).map_err(|error| {
+            Error::io(
+                "reverify private operator file",
+                std::io::Error::other(error.to_string()),
+            )
+        })?;
+        if !same_identity || before != after || after.len != bytes.len() as u64 {
+            return Err(Error::AuthorityConflict(
+                "private operator file changed while being read".to_owned(),
+            ));
+        }
+        Ok(bytes)
     }
 
     fn read_file_with_hook(
@@ -285,6 +477,28 @@ impl TrustedRoot {
         bytes: &[u8],
         replace: bool,
     ) -> Result<PublishOutcome> {
+        self.publish_file_internal(relative, bytes, replace, false)
+    }
+
+    /// Publishes one protected operator-selected file without replacing an
+    /// existing winner.
+    ///
+    /// Staging protects and re-verifies the file while it is still empty, and only
+    /// then writes the bytes, so the content is never on disk ahead of the
+    /// protection that guards it.
+    ///
+    /// Normative source: SPEC §8.6 and §14.2.
+    pub(crate) fn publish_private_file(&self, name: &Path, bytes: &[u8]) -> Result<PublishOutcome> {
+        self.publish_file_internal(name, bytes, false, true)
+    }
+
+    fn publish_file_internal(
+        &self,
+        relative: &Path,
+        bytes: &[u8],
+        replace: bool,
+        private: bool,
+    ) -> Result<PublishOutcome> {
         self.require_writable_authority_filesystem()?;
         let (parent_path, final_name) = split_file_path(relative)?;
         let parent = self.ensure_dir(&parent_path)?;
@@ -294,7 +508,11 @@ impl TrustedRoot {
             let counter = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
             let temporary_name = authority_temporary_name(&final_name, counter);
             let temporary_path = Path::new(&temporary_name);
-            let mut staged = match Self::write_new_file(&parent, temporary_path, bytes) {
+            let mut staged = match if private {
+                Self::create_private_staged_file(&parent, temporary_path)
+            } else {
+                Self::write_new_file(&parent, temporary_path, bytes)
+            } {
                 Ok(staged) => staged,
                 Err(Error::Io {
                     kind: std::io::ErrorKind::AlreadyExists,
@@ -302,6 +520,12 @@ impl TrustedRoot {
                 }) => continue,
                 Err(error) => return Err(error),
             };
+            if private {
+                if let Err(error) = Self::write_private_staged_file(&mut staged, bytes) {
+                    Self::remove_staged_file(&parent, temporary_path, &staged);
+                    return Err(error);
+                }
+            }
             if let Err(error) = Self::reverify_staged_file(&mut staged, bytes) {
                 Self::remove_staged_file(&parent, temporary_path, &staged);
                 return Err(error);
@@ -318,8 +542,11 @@ impl TrustedRoot {
                 Ok(PublishOutcome::Published) => {
                     #[cfg(not(windows))]
                     Self::sync_dir(&parent)?;
-                    let committed =
-                        Self::read_dir_file(&parent, Path::new(&final_name), bytes.len())?;
+                    let committed = if private {
+                        Self::read_private_dir_file(&parent, Path::new(&final_name), bytes.len())?
+                    } else {
+                        Self::read_dir_file(&parent, Path::new(&final_name), bytes.len())?
+                    };
                     if committed != bytes {
                         return Err(Error::AuthorityConflict(format!(
                             "published authority file {} does not match the committed bytes",
@@ -367,6 +594,15 @@ impl TrustedRoot {
         source: &Path,
         destination: &Path,
     ) -> Result<PublishOutcome> {
+        self.rename_directory_no_replace_with(source, destination, || Ok(()))
+    }
+
+    pub(crate) fn rename_directory_no_replace_with(
+        &self,
+        source: &Path,
+        destination: &Path,
+        after_rename: impl FnOnce() -> Result<()>,
+    ) -> Result<PublishOutcome> {
         self.require_writable_authority_filesystem()?;
         let (source_parent_path, source_name) = split_file_path(source)?;
         let (destination_parent_path, destination_name) = split_file_path(destination)?;
@@ -411,15 +647,96 @@ impl TrustedRoot {
         };
 
         if outcome == PublishOutcome::Published {
-            #[cfg(not(windows))]
-            {
-                Self::sync_dir(&source_parent)?;
-                if source_parent_path != destination_parent_path {
-                    Self::sync_dir(&destination_parent)?;
-                }
+            after_rename()?;
+            Self::sync_dir(&source_parent)?;
+            if source_parent_path != destination_parent_path {
+                Self::sync_dir(&destination_parent)?;
             }
         }
         Ok(outcome)
+    }
+
+    pub(crate) fn create_temporary_directory(
+        &self,
+        parent_path: &Path,
+        final_name: &OsStr,
+    ) -> Result<PathBuf> {
+        self.require_writable_authority_filesystem()?;
+        validate_relative(parent_path, true)?;
+        validate_relative(Path::new(final_name), false)?;
+        if Path::new(final_name).components().count() != 1 {
+            return Err(Error::field(
+                "authority_path",
+                "temporary directory target must be one path component",
+            ));
+        }
+        let parent = self.ensure_dir(parent_path)?;
+        self.cleanup_foreign_temporaries(&parent)?;
+        for _ in 0..TEMPORARY_ATTEMPTS {
+            let counter = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let temporary_name = authority_temporary_name(final_name, counter);
+            #[cfg(not(windows))]
+            let creation = parent.create_dir(Path::new(&temporary_name));
+            #[cfg(windows)]
+            let creation = {
+                let parent_file = parent
+                    .try_clone()
+                    .map_err(|error| Error::io("clone staged directory parent", error))?
+                    .into_std_file();
+                uchgs_windows_fs::create_directory(&parent_file, &temporary_name).map(drop)
+            };
+            match creation {
+                Ok(()) => {
+                    parent
+                        .open_dir_nofollow(Path::new(&temporary_name))
+                        .map_err(|error| Error::io("open staged authority directory", error))?;
+                    return Ok(parent_path.join(temporary_name));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(Error::io("create staged authority directory", error));
+                }
+            }
+        }
+        Err(Error::AuthorityConflict(format!(
+            "could not allocate a temporary authority name after {TEMPORARY_ATTEMPTS} attempts"
+        )))
+    }
+
+    pub(crate) fn sync_directory(&self, relative: &Path) -> Result<()> {
+        self.require_writable_authority_filesystem()?;
+        let directory = self.open_dir(relative)?;
+        Self::sync_dir(&directory)
+    }
+
+    pub(crate) fn same_root(&self, other: &Self) -> Result<bool> {
+        let this = self
+            .dir
+            .try_clone()
+            .map_err(|error| Error::io("clone first authority root identity", error))?
+            .into_std_file();
+        let other = other
+            .dir
+            .try_clone()
+            .map_err(|error| Error::io("clone second authority root identity", error))?
+            .into_std_file();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let this = this
+                .metadata()
+                .map_err(|error| Error::io("stat first authority root identity", error))?;
+            let other = other
+                .metadata()
+                .map_err(|error| Error::io("stat second authority root identity", error))?;
+            Ok(this.dev() == other.dev() && this.ino() == other.ino())
+        }
+        #[cfg(windows)]
+        {
+            uchgs_windows_fs::same_file_identity(&this, &other)
+                .map_err(|error| Error::io("compare authority root identity", error))
+        }
     }
 
     fn cleanup_foreign_temporaries(&self, parent: &Dir) -> Result<()> {
@@ -431,8 +748,11 @@ impl TrustedRoot {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name();
             let display = name.to_string_lossy();
-            if is_authority_temporary_name(&name) && !display.starts_with(&own_prefix) {
-                let _ = parent.remove_file(Path::new(&name));
+            if is_authority_temporary_name(&name)
+                && !display.starts_with(&own_prefix)
+                && parent.remove_file(Path::new(&name)).is_err()
+            {
+                let _ = parent.remove_dir_all(Path::new(&name));
             }
         }
         Ok(())
@@ -490,6 +810,34 @@ impl TrustedRoot {
         Ok(file)
     }
 
+    #[cfg(not(windows))]
+    fn create_private_staged_file(dir: &Dir, name: &Path) -> Result<File> {
+        validate_relative(name, false)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        options.follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        return Err(Error::UnsupportedPlatform(
+            "private staging requires Unix creation modes or Windows protected handles".into(),
+        ));
+
+        let mut file = dir
+            .open_with(name, &options)
+            .map_err(|error| Error::io("create staged private file", error))?;
+        let prepared = Self::protect_staged_private_file(&file)
+            .and_then(|()| Self::reverify_staged_file(&mut file, b""));
+        if let Err(error) = prepared {
+            let _ = dir.remove_file(name);
+            return Err(error);
+        }
+        Ok(file)
+    }
+
     #[cfg(windows)]
     pub(crate) fn write_new_file(
         dir: &Dir,
@@ -518,6 +866,105 @@ impl TrustedRoot {
             .sync_all()
             .map_err(|error| Error::io("sync staged authority file", error))?;
         Ok(opened)
+    }
+
+    #[cfg(windows)]
+    fn create_private_staged_file(
+        dir: &Dir,
+        name: &Path,
+    ) -> Result<uchgs_windows_fs::OpenedObject> {
+        validate_relative(name, false)?;
+        if name.components().count() != 1 {
+            return Err(Error::field(
+                "authority_path",
+                "staged private files must be direct children",
+            ));
+        }
+        let parent = dir
+            .try_clone()
+            .map_err(|error| Error::io("clone staged private parent", error))?
+            .into_std_file();
+        let descriptor =
+            uchgs_custody_platform::private_file_security_descriptor().map_err(|error| {
+                Error::io(
+                    "build staged private-file protection",
+                    std::io::Error::other(error.to_string()),
+                )
+            })?;
+        let mut opened = unsafe {
+            // The descriptor owns its allocation through this synchronous
+            // handle-relative create call.
+            uchgs_windows_fs::create_regular_with_security_descriptor(
+                &parent,
+                name.as_os_str(),
+                descriptor.as_ptr(),
+            )
+        }
+        .map_err(|error| Error::io("create staged private file", error))?;
+        Self::verify_staged_private_file(&opened)?;
+        Self::reverify_staged_file(&mut opened, b"")?;
+        Ok(opened)
+    }
+
+    #[cfg(not(windows))]
+    fn write_private_staged_file(file: &mut File, bytes: &[u8]) -> Result<()> {
+        file.write_all(bytes)
+            .map_err(|error| Error::io("write staged private file", error))?;
+        file.sync_all()
+            .map_err(|error| Error::io("sync staged private file", error))?;
+        Self::reverify_staged_file(file, bytes)?;
+        Self::verify_staged_private_file(file)
+    }
+
+    #[cfg(windows)]
+    fn write_private_staged_file(
+        file: &mut uchgs_windows_fs::OpenedObject,
+        bytes: &[u8],
+    ) -> Result<()> {
+        file.file_mut()
+            .write_all(bytes)
+            .map_err(|error| Error::io("write staged private file", error))?;
+        file.file()
+            .sync_all()
+            .map_err(|error| Error::io("sync staged private file", error))?;
+        Self::reverify_staged_file(file, bytes)?;
+        Self::verify_staged_private_file(file)
+    }
+
+    #[cfg(not(windows))]
+    fn protect_staged_private_file(file: &File) -> Result<()> {
+        let file = file
+            .try_clone()
+            .map_err(|error| Error::io("clone staged private file", error))?
+            .into_std();
+        uchgs_custody_platform::protect_private_file(&file).map_err(|error| {
+            Error::io(
+                "protect staged private file",
+                std::io::Error::other(error.to_string()),
+            )
+        })?;
+        file.sync_all()
+            .map_err(|error| Error::io("sync staged private-file protection", error))?;
+        uchgs_custody_platform::verify_private_file(&file).map_err(|error| {
+            Error::io(
+                "verify staged private file",
+                std::io::Error::other(error.to_string()),
+            )
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn verify_staged_private_file(file: &File) -> Result<()> {
+        let file = file
+            .try_clone()
+            .map_err(|error| Error::io("clone staged private file", error))?
+            .into_std();
+        uchgs_custody_platform::verify_private_file(&file).map_err(|error| {
+            Error::io(
+                "verify staged private file",
+                std::io::Error::other(error.to_string()),
+            )
+        })
     }
 
     #[cfg(not(windows))]
@@ -577,6 +1024,35 @@ impl TrustedRoot {
     #[cfg(not(windows))]
     fn remove_staged_file(parent: &Dir, temporary_name: &Path, _staged: &File) {
         let _ = parent.remove_file(temporary_name);
+    }
+
+    #[cfg(windows)]
+    fn protect_staged_private_file(file: &uchgs_windows_fs::OpenedObject) -> Result<()> {
+        uchgs_custody_platform::protect_private_file(file.file()).map_err(|error| {
+            Error::io(
+                "protect staged private file",
+                std::io::Error::other(error.to_string()),
+            )
+        })?;
+        file.file()
+            .sync_all()
+            .map_err(|error| Error::io("sync staged private-file protection", error))?;
+        uchgs_custody_platform::verify_private_file(file.file()).map_err(|error| {
+            Error::io(
+                "verify staged private file",
+                std::io::Error::other(error.to_string()),
+            )
+        })
+    }
+
+    #[cfg(windows)]
+    fn verify_staged_private_file(file: &uchgs_windows_fs::OpenedObject) -> Result<()> {
+        uchgs_custody_platform::verify_private_file(file.file()).map_err(|error| {
+            Error::io(
+                "verify staged private file",
+                std::io::Error::other(error.to_string()),
+            )
+        })
     }
 
     #[cfg(windows)]
@@ -686,6 +1162,27 @@ impl TrustedRoot {
             .sync_all()
             .map_err(|error| Error::io("sync authority directory", error))
     }
+
+    #[cfg(windows)]
+    pub(crate) fn sync_dir(dir: &Dir) -> Result<()> {
+        // Windows does not provide a directory-fsync operation equivalent to
+        // Unix. Every authority child create and rename is issued through a
+        // retained handle opened with FILE_WRITE_THROUGH; validating the
+        // directory's local-NTFS capability here closes that durability
+        // contract without retrying through an ambient pathname.
+        let handle = dir
+            .try_clone()
+            .map_err(|error| Error::io("clone directory for sync", error))?
+            .into_std_file();
+        let capability = match uchgs_windows_fs::volume_capability(&handle)
+            .map_err(|error| Error::io("query authority directory volume", error))?
+        {
+            uchgs_windows_fs::VolumeCapability::LocalNtfs => WindowsAuthorityCapability::LocalNtfs,
+            uchgs_windows_fs::VolumeCapability::Remote => WindowsAuthorityCapability::Remote,
+            uchgs_windows_fs::VolumeCapability::Other => WindowsAuthorityCapability::Other,
+        };
+        validate_windows_authority_capability(capability)
+    }
 }
 
 pub(crate) struct AuthorityLock {
@@ -696,6 +1193,77 @@ impl Drop for AuthorityLock {
     fn drop(&mut self) {
         let _ = fs2::FileExt::unlock(&self.file);
     }
+}
+
+#[cfg(unix)]
+fn private_file_snapshot(file: &std::fs::File) -> Result<PrivateFileSnapshot> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| Error::io("stat private operator file", error))?;
+    if !metadata.is_file() {
+        return Err(Error::field(
+            "operator_path",
+            "must identify one ordinary disk file",
+        ));
+    }
+    Ok(PrivateFileSnapshot {
+        len: metadata.len(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(windows)]
+fn private_file_snapshot(file: &std::fs::File) -> Result<PrivateFileSnapshot> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| Error::io("stat private operator file", error))?;
+    if !metadata.is_file() {
+        return Err(Error::field(
+            "operator_path",
+            "must identify one ordinary disk file",
+        ));
+    }
+    Ok(PrivateFileSnapshot {
+        len: metadata.file_size(),
+        attributes: metadata.file_attributes(),
+        creation_time: metadata.creation_time(),
+        last_write_time: metadata.last_write_time(),
+    })
+}
+
+#[cfg(unix)]
+fn private_file_identity_matches(
+    expected: &std::fs::File,
+    observed: &std::fs::File,
+) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let expected = expected
+        .metadata()
+        .map_err(|error| Error::io("stat retained private-file identity", error))?;
+    let observed = observed
+        .metadata()
+        .map_err(|error| Error::io("restat private-file identity", error))?;
+    Ok(expected.dev() == observed.dev() && expected.ino() == observed.ino())
+}
+
+#[cfg(windows)]
+fn private_file_identity_matches(
+    expected: &std::fs::File,
+    observed: &std::fs::File,
+) -> Result<bool> {
+    uchgs_windows_fs::same_file_identity(expected, observed)
+        .map_err(|error| Error::io("compare private-file identity", error))
 }
 
 fn split_file_path(path: &Path) -> Result<(PathBuf, OsString)> {
@@ -925,6 +1493,33 @@ mod tests {
     }
 
     #[test]
+    fn temporary_directory_creation_cleans_only_foreign_generated_residue() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = TrustedRoot::open(temp.path()).unwrap();
+        let parent = temp.path().join("bundles");
+        std::fs::create_dir_all(&parent).unwrap();
+        let foreign_pid = if std::process::id() == u32::MAX {
+            1
+        } else {
+            std::process::id() + 1
+        };
+        let foreign = format!(".tmp-authority-{foreign_pid}-1-stale");
+        std::fs::create_dir(parent.join(&foreign)).unwrap();
+        std::fs::write(parent.join(&foreign).join("partial"), b"partial").unwrap();
+        std::fs::create_dir(parent.join(".tmp-garbage")).unwrap();
+
+        let staged = root
+            .create_temporary_directory(Path::new("bundles"), OsStr::new("final"))
+            .unwrap();
+        assert!(!parent.join(foreign).exists());
+        assert!(parent.join(".tmp-garbage").exists());
+        assert!(temp.path().join(&staged).is_dir());
+        assert!(is_authority_temporary_name(
+            staged.file_name().expect("staged directory has a name")
+        ));
+    }
+
+    #[test]
     fn growth_after_initial_stat_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("growing");
@@ -942,6 +1537,89 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(error, Error::EncodedLengthExceeded { .. }));
+    }
+
+    #[test]
+    fn private_file_size_change_during_same_handle_read_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = TrustedRoot::open(temp.path()).unwrap();
+        assert_eq!(
+            root.publish_private_file(Path::new("operator.key"), b"secret"),
+            Ok(PublishOutcome::Published)
+        );
+
+        let result = root.read_private_file_with_hook(Path::new("operator.key"), 7, || {
+            std::fs::write(temp.path().join("operator.key"), b"changed").unwrap();
+        });
+        assert!(matches!(result, Err(Error::AuthorityConflict(_))));
+    }
+
+    #[test]
+    fn private_staging_residues_are_protected_before_and_after_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = TrustedRoot::open(temp.path()).unwrap();
+        let parent = root.ensure_dir(Path::new("")).unwrap();
+
+        let mut empty =
+            TrustedRoot::create_private_staged_file(&parent, Path::new("empty.tmp")).unwrap();
+        TrustedRoot::reverify_staged_file(&mut empty, b"").unwrap();
+        TrustedRoot::verify_staged_private_file(&empty).unwrap();
+        drop(empty);
+        let empty = std::fs::File::open(temp.path().join("empty.tmp")).unwrap();
+        uchgs_custody_platform::verify_private_file(&empty).unwrap();
+        assert_eq!(empty.metadata().unwrap().len(), 0);
+
+        let mut written =
+            TrustedRoot::create_private_staged_file(&parent, Path::new("written.tmp")).unwrap();
+        TrustedRoot::write_private_staged_file(&mut written, b"private bytes").unwrap();
+        drop(written);
+        let written = std::fs::File::open(temp.path().join("written.tmp")).unwrap();
+        uchgs_custody_platform::verify_private_file(&written).unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("written.tmp")).unwrap(),
+            b"private bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_staging_creation_mode_is_independent_of_umask() {
+        const CHILD: &str = "UCHGS_PRIVATE_STAGING_UMASK_CHILD";
+        const TEST: &str =
+            "authority_file::tests::private_staging_creation_mode_is_independent_of_umask";
+
+        if std::env::var_os(CHILD).is_some() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let temp = tempfile::tempdir().unwrap();
+            let root = TrustedRoot::open(temp.path()).unwrap();
+            let parent = root.ensure_dir(Path::new("")).unwrap();
+            let staged =
+                TrustedRoot::create_private_staged_file(&parent, Path::new("private.tmp")).unwrap();
+            let metadata = staged.try_clone().unwrap().into_std().metadata().unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            return;
+        }
+
+        let test_binary = std::env::current_exe().unwrap();
+        for mask in ["000", "022", "077"] {
+            let status = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("umask \"$1\"; shift; exec \"$@\"")
+                .arg("sh")
+                .arg(mask)
+                .arg(&test_binary)
+                .arg("--exact")
+                .arg(TEST)
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "private staging failed under umask {mask}"
+            );
+        }
     }
 
     #[cfg(not(windows))]

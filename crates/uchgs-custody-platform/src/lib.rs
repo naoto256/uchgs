@@ -318,6 +318,27 @@ pub fn protect_private_file(file: &fs::File) -> Result<(), Error> {
     }
 }
 
+/// Owns the exact protected DACL used when Windows creates a private file.
+///
+/// Keeping construction beside `protect_private_file` prevents create-time and
+/// post-create protection from drifting into two different policies.
+#[cfg(windows)]
+pub struct PrivateFileSecurityDescriptor(windows_private_file::OwnedSecurityDescriptor);
+
+#[cfg(windows)]
+impl PrivateFileSecurityDescriptor {
+    pub fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.0.as_ptr()
+    }
+}
+
+/// Builds the same protected current-user DACL that `protect_private_file`
+/// applies to an already-opened Windows file.
+#[cfg(windows)]
+pub fn private_file_security_descriptor() -> Result<PrivateFileSecurityDescriptor, Error> {
+    windows_private_file::security_descriptor().map(PrivateFileSecurityDescriptor)
+}
+
 /// Verifies protection on the same already-opened private file.
 ///
 /// Verification has to observe the object the caller already holds; re-resolving the
@@ -420,6 +441,22 @@ mod windows_private_file {
         }
     }
 
+    pub(super) struct OwnedSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl OwnedSecurityDescriptor {
+        pub(super) fn as_ptr(&self) -> *mut c_void {
+            self.0.cast()
+        }
+    }
+
+    impl Drop for OwnedSecurityDescriptor {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0.cast());
+            }
+        }
+    }
+
     fn current_user_token() -> Result<(OwnedHandle, Vec<usize>), Error> {
         let mut handle = ptr::null_mut();
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle) } == 0 {
@@ -481,7 +518,7 @@ mod windows_private_file {
         }
     }
 
-    pub(super) fn protect(file: &fs::File) -> Result<(), Error> {
+    pub(super) fn security_descriptor() -> Result<OwnedSecurityDescriptor, Error> {
         let (_handle, token) = current_user_token()?;
         let sid = token_sid(&token)?;
         let mut sid_text = ptr::null_mut();
@@ -523,16 +560,18 @@ mod windows_private_file {
                 std::io::Error::last_os_error(),
             ));
         }
+        Ok(OwnedSecurityDescriptor(descriptor))
+    }
+
+    pub(super) fn protect(file: &fs::File) -> Result<(), Error> {
+        let descriptor = security_descriptor()?;
         let result = unsafe {
             SetKernelObjectSecurity(
                 file.as_raw_handle() as HANDLE,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                descriptor,
+                descriptor.0,
             )
         };
-        unsafe {
-            LocalFree(descriptor.cast());
-        }
         if result == 0 {
             return Err(Error::io(
                 "protect private key DACL",

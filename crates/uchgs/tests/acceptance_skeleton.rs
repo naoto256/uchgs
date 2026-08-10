@@ -479,50 +479,12 @@ acceptance_skeleton!(
 );
 
 // SPEC §16「鍵の登録」; normative rules: SPEC §8.
-acceptance_skeleton!(
-    registry_01_genesis_can_approve_later_enrollment,
-    "genesis鍵は最初のpolicy承認後も登録を承認できる",
-    "SPEC §8.2–§8.3"
-);
-acceptance_skeleton!(
-    registry_02_unregistered_signer_cannot_enroll,
-    "未登録鍵による登録を拒否する",
-    "SPEC §8.3"
-);
-// registry_03–05 は authority_acceptance.rs で解禁済み。
-acceptance_skeleton!(
-    registry_06_plaintext_private_keys_are_unsupported,
-    "平文秘密鍵を生成せず受け付けない",
-    "SPEC §8.6"
-);
+// registry_01–02 は ceremony.rs、registry_03–05 は
+// authority_acceptance.rs で解禁済み。
+// registry_06 と registry_08–12 は software_key.rs で解禁済み。
 acceptance_skeleton!(
     registry_07_passphrase_uses_only_controlling_terminal,
     "passphraseをstdin・環境・引数から受けず制御端末だけで読む",
-    "SPEC §8.6"
-);
-acceptance_skeleton!(
-    registry_08_empty_passphrase_is_rejected,
-    "空passphraseを拒否する",
-    "SPEC §8.6"
-);
-acceptance_skeleton!(
-    registry_09_envelope_public_tamper_breaks_decryption,
-    "封筒公開部の改変で復号を失敗させる",
-    "SPEC §8.6"
-);
-acceptance_skeleton!(
-    registry_10_wrong_passphrase_fails_decryption,
-    "誤passphraseで復号を失敗させる",
-    "SPEC §8.6"
-);
-acceptance_skeleton!(
-    registry_11_seed_public_key_must_match_credential,
-    "seed由来公開鍵と封筒credentialの不一致を拒否する",
-    "SPEC §8.6"
-);
-acceptance_skeleton!(
-    registry_12_openssh_private_keys_are_unsupported,
-    "OpenSSH形式の鍵を受け付けない",
     "SPEC §8.6"
 );
 
@@ -544,30 +506,12 @@ acceptance_skeleton!(
 );
 
 // SPEC §16「delegate」; normative rules: SPEC §9.
-acceptance_skeleton!(
-    delegate_02_binary_derives_interval_from_ttl,
-    "--ttlから期間をバイナリが算出する",
-    "SPEC §9.1, §12.1"
-);
-acceptance_skeleton!(
-    delegate_03_exits_on_expiry,
-    "期限切れでdaemonが自発終了する",
-    "SPEC §9.2"
-);
-acceptance_skeleton!(
-    delegate_04_zeroizes_key_on_sigint_and_sigterm,
-    "SIGINT・SIGTERMで鍵をゼロ埋めして終了する",
-    "SPEC §9.2"
-);
+// delegate_02 と delegate_07 は delegate.rs で解禁済み。
+// delegate_03–04 は delegate.rs で解禁済み。
 acceptance_skeleton!(
     delegate_05_has_no_stop_channel,
     "停止用socket・pipe・control fileが存在しない",
     "SPEC §9.2, §12.1"
-);
-acceptance_skeleton!(
-    delegate_07_approval_verifies_after_authority_expires,
-    "委任承認は自己完結し権限消滅後も検証できる",
-    "SPEC §7.3–§7.4, §9.3, §9.5"
 );
 
 // SPEC §16「失敗の出し方」; normative rules: SPEC §13.2, §15.
