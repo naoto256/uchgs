@@ -336,11 +336,7 @@ fix encoding\n";
         "3bdc2f5072b618cede691d92d8a955438b0f61c494fba34277e2e6f879d4585e"
     );
 }
-acceptance_skeleton!(
-    extract_17_commit_gate_accepts_non_utf8_author_identity,
-    "git var GIT_AUTHOR_IDENTの出力がUTF-8でなくてもcommit gateが動く",
-    "SPEC §3.1, §10.4, Appendix A.8"
-);
+// extract_17 is implemented in commit_gate.rs against SPEC §3.1, §10.4, and A.8.
 
 // SPEC §16「鍵」; normative rules: SPEC §2.2, §3, §6.3.
 /// SPEC §16「同じbytesでも種類が違えば別鍵」; SPEC §2.2, §3–§4.
@@ -361,36 +357,13 @@ acceptance_skeleton!(
 // SPEC §16「承認の自己完結」は authority_acceptance.rs で解禁済み。
 
 // SPEC §16「commit gate」; normative rules: SPEC §10.
-acceptance_skeleton!(
-    commit_gate_01_requires_only_units_absent_from_head,
-    "HEADに無い単位だけを要求する",
-    "SPEC §10.1"
-);
-acceptance_skeleton!(
-    commit_gate_02_unborn_repo_requires_full_tree,
-    "HEADが無いrepoではtree全体のfileとpathを要求する",
-    "SPEC §10.1"
-);
-acceptance_skeleton!(
-    commit_gate_03_deletion_only_requires_new_commit,
-    "削除だけのcommitでも新しいcommitを要求し消えたfile/pathは要求しない",
-    "SPEC §10.3–§10.4"
-);
-acceptance_skeleton!(
-    commit_gate_04_commit_msg_reads_all_bytes_without_rewrite,
-    "commit-msgはコメントを含む全バイトを見てファイルを書き換えない",
-    "SPEC §10.2"
-);
+// commit_gate_01–04 are implemented in commit_gate.rs against SPEC §10.1–§10.4.
 acceptance_skeleton!(
     commit_gate_05_cleanup_changed_message_is_required_at_push,
     "cleanupで変わったmessageはpush gateで再要求する",
     "SPEC §10.2, §11.3"
 );
-acceptance_skeleton!(
-    commit_gate_06_already_judged_units_are_not_required,
-    "判定済み単位を再要求せず同じcommitの2回目は空になる",
-    "SPEC §10.1"
-);
+// commit_gate_06 is implemented in commit_gate.rs against SPEC §10.1.
 
 // SPEC §16「push gate」; normative rules: SPEC §11.
 acceptance_skeleton!(

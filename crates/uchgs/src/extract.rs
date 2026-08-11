@@ -34,7 +34,7 @@ impl ObjectFormat {
     /// Returns the exact hexadecimal object-ID width for this repository format.
     ///
     /// Normative source: SPEC §2.3 and §3.3.
-    fn oid_hex_bytes(self) -> usize {
+    pub(crate) fn oid_hex_bytes(self) -> usize {
         self.oid_bytes() * 2
     }
 }
@@ -198,6 +198,13 @@ impl JudgmentUnit {
         let bytes = bytes.into();
         validate_ref(&bytes)?;
         Ok(Self::from_extracted(UnitKind::Ref, bytes))
+    }
+
+    /// Binds the exact synthetic commit bytes assembled before a commit exists.
+    ///
+    /// The caller must construct the closed identity/message form from SPEC §10.4.
+    pub(crate) fn commit(bytes: Vec<u8>) -> Self {
+        Self::from_extracted(UnitKind::Commit, bytes)
     }
 
     /// Returns this unit's closed kind.
@@ -489,7 +496,7 @@ fn require_single_line(header: &Header<'_>, label: &'static str) -> Result<()> {
 /// Removes the validated timestamp and zone suffix from a Git identity.
 ///
 /// Normative source: SPEC §3.1–§3.3.
-fn extract_identity<'a>(value: &'a [u8], label: &'static str) -> Result<&'a [u8]> {
+pub(crate) fn extract_identity<'a>(value: &'a [u8], label: &'static str) -> Result<&'a [u8]> {
     let zone_separator = value
         .iter()
         .rposition(|byte| *byte == b' ')
