@@ -1062,6 +1062,9 @@ mod tests {
         #[cfg(windows)]
         {
             let mut permissions = fs::metadata(&published_tree_path).unwrap().permissions();
+            // Windows clears FILE_ATTRIBUTE_READONLY here; this cfg block
+            // cannot compile into the Unix permission-widening path.
+            #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
             fs::set_permissions(&published_tree_path, permissions).unwrap();
         }
