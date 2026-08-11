@@ -9,6 +9,7 @@ mod git_traversal;
 pub mod ledger;
 pub mod pending;
 pub mod policy;
+pub mod push_gate;
 pub mod registry;
 pub mod signer;
 pub mod software_key;
