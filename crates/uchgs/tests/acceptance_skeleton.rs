@@ -358,69 +358,11 @@ acceptance_skeleton!(
 
 // SPEC §16「commit gate」; normative rules: SPEC §10.
 // commit_gate_01–04 are implemented in commit_gate.rs against SPEC §10.1–§10.4.
-acceptance_skeleton!(
-    commit_gate_05_cleanup_changed_message_is_required_at_push,
-    "cleanupで変わったmessageはpush gateで再要求する",
-    "SPEC §10.2, §11.3"
-);
+// commit_gate_05 is implemented in push_gate.rs against SPEC §10.2 and §11.3.
 // commit_gate_06 is implemented in commit_gate.rs against SPEC §10.1.
 
 // SPEC §16「push gate」; normative rules: SPEC §11.
-acceptance_skeleton!(
-    push_gate_01_excludes_all_published_origin_tips,
-    "originの全tipにある公開済みobjectを除外する",
-    "SPEC §11.2–§11.3"
-);
-acceptance_skeleton!(
-    push_gate_02_new_branch_excludes_shared_history,
-    "新branchのpushでも共有履歴を要求しない",
-    "SPEC §11.2–§11.3"
-);
-acceptance_skeleton!(
-    push_gate_03_missing_local_origin_tip_increases_target,
-    "ローカルに無いorigin tipは除外せず対象が増える",
-    "SPEC §11.2–§11.3"
-);
-acceptance_skeleton!(
-    push_gate_04_ls_remote_failure_fails_gate,
-    "ls-remote失敗時にgateも失敗する",
-    "SPEC §11.2"
-);
-acceptance_skeleton!(
-    push_gate_05_delete_update_has_no_target,
-    "削除updateは対象を生まない",
-    "SPEC §11.3"
-);
-acceptance_skeleton!(
-    push_gate_06_paths_use_all_target_commit_root_trees,
-    "path新側は対象全commit root tree和集合で途中追加後削除の名前も要求する",
-    "SPEC §10.1 step 3, §11.3"
-);
-acceptance_skeleton!(
-    push_gate_07_direct_tree_publication_yields_paths,
-    "direct tree refとtag対象treeはpathを要求しdirect blob refはfileだけ",
-    "SPEC §10.1 step 3, §11.3"
-);
-acceptance_skeleton!(
-    push_gate_08_missing_shallow_or_partial_objects_fail_with_recovery,
-    "欠落object・shallow・partialは具体的復旧手順付きで失敗する",
-    "SPEC §11.3"
-);
-acceptance_skeleton!(
-    push_gate_09_rejects_url_instead_of_remote_name,
-    "remote名ではなくURLを渡すpushを拒否する",
-    "SPEC §11.1"
-);
-acceptance_skeleton!(
-    push_gate_10_push_intent_omits_connection_url,
-    "PushIntentに接続先URLを保存しない",
-    "SPEC §11.1"
-);
-acceptance_skeleton!(
-    push_gate_11_state_scope_ignores_ref_namespace,
-    "状態観点がrefの名前空間で絞られない",
-    "SPEC §5.3, §11.4"
-);
+// push_gate_01–11 are implemented in push_gate.rs against SPEC §11.
 
 // SPEC §16「承認」7項目は authority_acceptance.rs で解禁済み。
 

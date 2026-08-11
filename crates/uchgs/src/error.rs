@@ -3,6 +3,7 @@ use std::fmt;
 /// A fail-closed wire, cryptographic, authority, or durable-I/O error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    InvalidArguments(String),
     EmptyInput,
     EncodedLengthExceeded {
         maximum: usize,
@@ -23,6 +24,7 @@ pub enum Error {
         count: usize,
     },
     GitUnavailable(String),
+    RemoteUnavailable(String),
     UnsupportedPlatform(String),
     Io {
         operation: &'static str,
@@ -51,6 +53,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidArguments(reason) => write!(formatter, "invalid arguments: {reason}"),
             Self::EmptyInput => formatter.write_str("wire input is empty"),
             Self::EncodedLengthExceeded { maximum, actual } => write!(
                 formatter,
@@ -76,6 +79,7 @@ impl fmt::Display for Error {
                 write!(formatter, "{count} required judgment(s) are missing")
             }
             Self::GitUnavailable(reason) => write!(formatter, "git unavailable: {reason}"),
+            Self::RemoteUnavailable(reason) => write!(formatter, "remote unavailable: {reason}"),
             Self::UnsupportedPlatform(reason) => {
                 write!(formatter, "unsupported platform: {reason}")
             }
