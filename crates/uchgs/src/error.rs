@@ -19,6 +19,10 @@ pub enum Error {
     UnauthorizedApproval(String),
     PolicyMissing(String),
     PolicyInvalid(String),
+    JudgmentMissing {
+        count: usize,
+    },
+    GitUnavailable(String),
     UnsupportedPlatform(String),
     Io {
         operation: &'static str,
@@ -68,6 +72,10 @@ impl fmt::Display for Error {
             }
             Self::PolicyMissing(reason) => write!(formatter, "policy missing: {reason}"),
             Self::PolicyInvalid(reason) => write!(formatter, "policy invalid: {reason}"),
+            Self::JudgmentMissing { count } => {
+                write!(formatter, "{count} required judgment(s) are missing")
+            }
+            Self::GitUnavailable(reason) => write!(formatter, "git unavailable: {reason}"),
             Self::UnsupportedPlatform(reason) => {
                 write!(formatter, "unsupported platform: {reason}")
             }
